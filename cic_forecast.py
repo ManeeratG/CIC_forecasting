@@ -40,36 +40,125 @@ np.random.seed(42)
 # SECTION 1 — DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_sk_ny_dummies(df, hol):
+    """
+    Build Songkran (SK) and New Year (NY) pre/post holiday dummies.
+
+    Holiday sheet only covers 2014-2026.  To ensure stable OLS coefficient
+    estimates (one event per year across all training years), SK and NY dates
+    are extended back to 1997 using fixed-calendar heuristics:
+      SK  → April 13–15 (Thai calendar, fixed)
+      NY  → January 1 + December 31
+
+    All four dummies are mutually exclusive (no overlapping coverage):
+      D_SK_PRE1  : last trading day before each Songkran block
+      D_SK_POST1 : first trading day after each Songkran block
+      D_NY_PRE1  : last trading day before each New Year block
+      D_NY_POST1 : first trading day after each New Year block
+    """
+    trading_dates = sorted(df.index.normalize().tolist())
+
+    # --- Build SK dates for ALL years covered by df ---
+    sk_from_sheet = set(
+        hol.loc[hol['Description'].str.contains('Songkran', case=False, na=False),
+                'Date'].dt.normalize()
+    )
+    min_sk_year = min(d.year for d in sk_from_sheet) if sk_from_sheet else 2014
+    sk_dates = set(sk_from_sheet)
+    start_yr = df.index.year.min()
+    for yr in range(start_yr, min_sk_year):
+        for mday in [(4, 13), (4, 14), (4, 15)]:
+            sk_dates.add(pd.Timestamp(yr, *mday))
+
+    # --- Build NY dates for ALL years ---
+    ny_from_sheet = set(
+        hol.loc[hol['Description'].str.contains('New Year', case=False, na=False),
+                'Date'].dt.normalize()
+    )
+    min_ny_year = min(d.year for d in ny_from_sheet) if ny_from_sheet else 2014
+    ny_dates = set(ny_from_sheet)
+    for yr in range(start_yr, min_ny_year):
+        ny_dates.add(pd.Timestamp(yr, 1, 1))
+        ny_dates.add(pd.Timestamp(yr, 12, 31))
+
+    def holiday_blocks(hol_set):
+        """Group consecutive holiday dates (gap ≤ 3 calendar days) into blocks."""
+        if not hol_set:
+            return []
+        sorted_h = sorted(hol_set)
+        blocks, bs, be = [], sorted_h[0], sorted_h[0]
+        for d in sorted_h[1:]:
+            if (d - be).days <= 3:
+                be = d
+            else:
+                blocks.append((bs, be))
+                bs = be = d
+        blocks.append((bs, be))
+        return blocks
+
+    def nearest_td(blocks, n_pre, n_post):
+        """For each block, find the nearest n_pre/n_post trading days before/after."""
+        pre_idx, post_idx = set(), set()
+        for bs, be in blocks:
+            pre_td  = [t for t in trading_dates if t < bs]
+            post_td = [t for t in trading_dates if t > be]
+            for lag in range(1, n_pre + 1):
+                if lag <= len(pre_td):
+                    pre_idx.add(pre_td[-lag])
+            for lag in range(1, n_post + 1):
+                if lag <= len(post_td):
+                    post_idx.add(post_td[lag - 1])
+        return pre_idx, post_idx
+
+    sk_blocks = holiday_blocks(sk_dates)
+    ny_blocks = holiday_blocks(ny_dates)
+
+    sk_pre1_idx, sk_post1_idx = nearest_td(sk_blocks, 1, 1)
+    ny_pre1_idx, ny_post1_idx = nearest_td(ny_blocks, 1, 1)
+
+    idx = df.index.normalize()
+    df['D_SK_PRE1']  = idx.isin(sk_pre1_idx).astype(float)
+    df['D_SK_POST1'] = idx.isin(sk_post1_idx).astype(float)
+    df['D_NY_PRE1']  = idx.isin(ny_pre1_idx).astype(float)
+    df['D_NY_POST1'] = idx.isin(ny_post1_idx).astype(float)
+    return df
+
+
 def load_data(filepath='input.xlsx'):
-    raw = pd.read_excel(filepath, sheet_name='DATA change (2)', header=None, skiprows=1)
-    col_names = raw.iloc[0].tolist()
-    raw = raw.iloc[1:].copy()
-    clean_cols = [f'_x{i}' if isinstance(c, float) and np.isnan(c) else str(c)
-                  for i, c in enumerate(col_names[:len(raw.columns)])]
-    raw.columns = clean_cols
-    raw = raw.reset_index(drop=True)
+    # RAW sheet: header in row 1 (0-indexed)
+    raw = pd.read_excel(filepath, sheet_name='RAW', header=1)
 
     raw['Date']     = pd.to_datetime(raw['Date'],     errors='coerce')
     raw['Currency'] = pd.to_numeric(raw['Currency'],  errors='coerce')
-    raw['Change']   = pd.to_numeric(raw['Change'],    errors='coerce')
 
-    df = raw.dropna(subset=['Date', 'Change']).sort_values('Date').reset_index(drop=True)
+    # Change column in RAW is all NaN — compute from Currency levels
+    raw = raw.sort_values('Date').reset_index(drop=True)
+    raw['Change'] = raw['Currency'].diff()
+
+    df = raw.dropna(subset=['Date', 'Change']).copy()
 
     dummy_cols = [c for c in df.columns if c.startswith('D_') or c.startswith('Date_')]
     for c in dummy_cols:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(float)
 
-    # Post-COVID regime dummy (Direction 3): step from April 2020
-    df['D_PostCovid'] = (df['Date'] >= '2020-04-01').astype(float)
+    df = df.set_index('Date')
+    df.index = df.index.normalize()
 
-    # Annual Fourier terms (Direction 1, supplementary)
+    # Post-COVID regime dummy (step from April 2020)
+    df['D_PostCovid'] = (df.index >= pd.Timestamp('2020-04-01')).astype(float)
+
+    # Annual Fourier terms
     t = np.arange(len(df), dtype=float)
     P_ann = 261.0
     for k in range(1, 4):
         df[f'sin_ann_{k}'] = np.sin(2 * np.pi * k * t / P_ann)
         df[f'cos_ann_{k}'] = np.cos(2 * np.pi * k * t / P_ann)
 
-    df = df.set_index('Date')
+    # Build SK / NY dummies from holiday sheet
+    hol = pd.read_excel(filepath, sheet_name='holiday')
+    hol['Date'] = pd.to_datetime(hol['Date'])
+    df = _build_sk_ny_dummies(df, hol)
+
     return df
 
 
@@ -83,15 +172,15 @@ WOM_COLS = ['D_WEEK2', 'D_WEEK3', 'D_WEEK4', 'D_WEEK5']
 MON_COLS = ['D_JAN', 'D_FEB', 'D_MAR', 'D_APR', 'D_MAY', 'D_JUN',
             'D_JUL', 'D_AUG', 'D_SEP', 'D_OCT', 'D_NOV']
 HOL_OLD  = ['D_PRE_LH1', 'D_PRE_LH3', 'D_POST_LH3', 'D_PRE_SH1', 'D_Covid_1st', 'D_LWD']
-HOL_EXT  = ['D_PRE_SK1', 'D_PRE_SK3', 'D_POST_SK3', 'D_PRE_NY1', 'D_PRE_NY3', 'D_POST_NY3']
+HOL_EXT  = ['D_SK_PRE1', 'D_SK_POST1', 'D_NY_PRE1', 'D_NY_POST1']
 REGIME   = ['D_PostCovid']
 FOURIER  = [f'{fn}_ann_{k}' for fn in ['sin', 'cos'] for k in range(1, 4)]
 
 REGS = {
-    'Old_2022':      DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD,
-    'ExtDummy':      DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT,
-    'Regime':        DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT + REGIME,
-    'Fourier_Regime':DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT + REGIME + FOURIER,
+    'Old_2022':       DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD,
+    'ExtDummy':       DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT,
+    'Regime':         DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT + REGIME,
+    'Fourier_Regime': DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD + HOL_EXT + REGIME + FOURIER,
 }
 
 MODEL_LABELS = {
@@ -134,8 +223,8 @@ class TwoStepARIMAX:
     """
 
     def __init__(self):
-        self.ols     = None
-        self.arima   = None
+        self.ols      = None
+        self.arima    = None
         self.n_params = None
         self.n_obs    = None
         self.resid    = None
@@ -146,45 +235,34 @@ class TwoStepARIMAX:
         X = np.asarray(X, dtype=float)
         n, p = X.shape
 
-        # Step 1: OLS
-        self.ols = LinearRegression(fit_intercept=True).fit(X, y)
-        ols_fitted = self.ols.predict(X)
-        ols_resid  = y - ols_fitted
+        self.ols      = LinearRegression(fit_intercept=True).fit(X, y)
+        ols_fitted    = self.ols.predict(X)
+        ols_resid     = y - ols_fitted
 
-        # Step 2: ARIMA(1,0,1) on OLS residuals
-        arima_mod = ARIMA(ols_resid, order=(1, 0, 1), trend='n')
+        arima_mod  = ARIMA(ols_resid, order=(1, 0, 1), trend='n')
         self.arima = arima_mod.fit(method='innovations_mle')
 
-        self.resid   = self.arima.resid
-        self.fitted  = ols_fitted + self.arima.fittedvalues
-        self.n_obs   = n
-        self.n_params = (p + 1) + 2 + 1   # OLS (incl. intercept) + AR,MA + sigma2
+        self.resid    = self.arima.resid
+        self.fitted   = ols_fitted + self.arima.fittedvalues
+        self.n_obs    = n
+        self.n_params = (p + 1) + 2 + 1  # OLS (incl. intercept) + AR,MA + sigma2
 
-        # Approximate log-likelihood from ARIMA stage
         self._logL = self.arima.llf
+        k          = self.n_params
+        self.aic   = -2 * self._logL + 2 * k
+        self.bic   = -2 * self._logL + k * np.log(n)
 
-        # Information criteria (penalise all params jointly)
-        k = self.n_params
-        self.aic = -2 * self._logL + 2 * k
-        self.bic = -2 * self._logL + k * np.log(n)
-
-        # Useful attributes for display
         pn = self.arima.param_names
         pv = self.arima.params
-        pd_ser = pd.Series(pv, index=pn)
-        self.ar1     = float(pd_ser.get('ar.L1', np.nan))
-        self.ma1     = float(pd_ser.get('ma.L1', np.nan))
-        self.sigma   = float(np.sqrt(pd_ser.get('sigma2', np.nan)))
+        pd_ser   = pd.Series(pv, index=pn)
+        self.ar1   = float(pd_ser.get('ar.L1',  np.nan))
+        self.ma1   = float(pd_ser.get('ma.L1',  np.nan))
+        self.sigma = float(np.sqrt(pd_ser.get('sigma2', np.nan)))
         return self
 
     def forecast(self, X_future, steps=None):
-        """
-        Dynamic forecast: OLS mean forecast + ARIMA extrapolation.
-        For h > ~5, ARIMA(1,1) contribution decays to ~0 and the forecast
-        is driven almost entirely by the calendar/dummy mean equation.
-        """
         X_future = np.asarray(X_future, dtype=float)
-        n_fc = len(X_future)
+        n_fc     = len(X_future)
         mean_fc  = self.ols.predict(X_future)
         arima_fc = self.arima.forecast(steps=n_fc)
         return mean_fc + np.asarray(arima_fc)
@@ -210,13 +288,13 @@ def run_diagnostics(residuals, label=''):
     out['lb_pval_20'] = float(lb['lb_pvalue'].iloc[1])
 
     if label:
-        print(f'\n  [{label}]')
-        print(f'    ADF:     stat={adf_stat:7.3f}  p={adf_pval:.4f}  '
+        print(f'\n  [{label}] Residual Diagnostics:')
+        print(f'    ADF stationary test:   stat={adf_stat:7.3f}  p={adf_pval:.4f}  '
               f'{"✓ stationary" if adf_pval<0.05 else "⚠ non-stationary"}')
-        print(f'    ARCH-LM: stat={arch_stat:7.3f}  p={arch_pval:.4f}  '
+        print(f'    ARCH-LM(10):           stat={arch_stat:7.3f}  p={arch_pval:.4f}  '
               f'{"⚠ ARCH effects → GARCH warranted" if arch_pval<0.05 else "✓ no ARCH effects"}')
-        print(f'    LjungBox:  p(10)={out["lb_pval_10"]:.4f}  p(20)={out["lb_pval_20"]:.4f}  '
-              f'{"⚠ autocorrelation" if out["lb_pval_10"]<0.05 else "✓ white noise"}')
+        print(f'    Ljung-Box p(10/20):   {out["lb_pval_10"]:.4f} / {out["lb_pval_20"]:.4f}  '
+              f'{"⚠ residual autocorrelation" if out["lb_pval_10"]<0.05 else "✓ white noise"}')
     return out
 
 
@@ -250,10 +328,11 @@ def rolling_backtest(df, model_names, windows):
             X_tr, _ = get_X(df_tr, mname)
             X_ev, _ = get_X(df_ev, mname)
             try:
-                mdl = TwoStepARIMAX().fit(df_tr['Change'].values, X_tr)
+                mdl  = TwoStepARIMAX().fit(df_tr['Change'].values, X_tr)
                 pred = mdl.forecast(X_ev)
                 m    = compute_metrics(df_ev['Change'].values, pred)
-                print(f'    {MODEL_LABELS[mname]:<24}  RMSE={m["RMSE"]:.3f}  MAE={m["MAE"]:.3f}')
+                print(f'    {MODEL_LABELS[mname]:<24}  RMSE={m["RMSE"]:.3f}  MAE={m["MAE"]:.3f}  '
+                      f'ResidSD={m["ResidSD"]:.3f}')
             except Exception as exc:
                 print(f'    ⚠ {mname}: {exc}')
                 m = {'RMSE': np.nan, 'MAE': np.nan, 'ResidSD': np.nan, 'n': 0}
@@ -262,10 +341,6 @@ def rolling_backtest(df, model_names, windows):
 
 
 def horizon_rmse_monthly(df, model_names, monthly_origins, horizons=(1, 5, 10, 22)):
-    """
-    For each monthly origin, refit and forecast h steps ahead.
-    Returns {model_name: {h: rmse}} across origins.
-    """
     store = {m: {h: [] for h in horizons} for m in model_names}
 
     for origin_str in monthly_origins:
@@ -304,7 +379,7 @@ def horizon_rmse_monthly(df, model_names, monthly_origins, horizons=(1, 5, 10, 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 6 — GARCH (Direction 2)
+# SECTION 6 — GARCH
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fit_garch(residuals, label='GARCH(1,1)'):
@@ -325,7 +400,7 @@ def _save(fig, directory, filename):
     path = os.path.join(directory, filename)
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f'  Saved → {path}')
+    print(f'  Saved → ./{filename}')
 
 
 def plot_fig1_overview(df, save_dir='.'):
@@ -337,9 +412,7 @@ def plot_fig1_overview(df, save_dir='.'):
     ax.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
                alpha=0.12, color='red', label='COVID period')
     ax.axvline(pd.Timestamp('2020-03-24'), color='red', lw=1.2, ls='--', alpha=0.7,
-               label='COVID 4-day dummy (old model)')
-    ax.axvline(pd.Timestamp('2020-04-01'), color='green', lw=1.2, ls='--', alpha=0.7,
-               label='Post-COVID regime step (new model)')
+               label='COVID 4-day dummy (D_Covid_1st)')
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     ax.set_title('Currency in Circulation — Daily Level (1997–2022)', fontsize=13, fontweight='bold')
     ax.legend(fontsize=9)
@@ -369,8 +442,8 @@ def plot_fig2_actual_vs_forecast(df_eval, forecast_dict, save_dir='.'):
     ax.plot(dates, actual, color='#333333', lw=1.5, label='Actual', zorder=5)
     for mname, pred in forecast_dict.items():
         rmse = np.sqrt(np.mean((actual - pred)**2))
-        lw   = 1.8 if mname == 'Regime' else 1.1
-        alp  = 0.95 if mname == 'Regime' else 0.65
+        lw   = 1.8 if mname == 'ExtDummy' else 1.1
+        alp  = 0.95 if mname == 'ExtDummy' else 0.65
         ax.plot(dates, pred, color=COLORS.get(mname, 'grey'), lw=lw, alpha=alp,
                 label=f'{MODEL_LABELS[mname]}  RMSE={rmse:.3f}')
 
@@ -481,7 +554,7 @@ def plot_fig5_rmse_comparison(bench_metrics, rolling_metrics, save_dir='.'):
     ax.set_ylim(0, max(8.5, max(rmse_vals) * 1.2))
 
     ax = axes[1]
-    compare = [m for m in ['Old_2022', 'Regime'] if m in rolling_metrics]
+    compare = [m for m in ['Old_2022', 'ExtDummy'] if m in rolling_metrics]
     windows  = list(next(iter(rolling_metrics.values())).keys()) if rolling_metrics else []
     x = np.arange(len(windows))
     w = 0.35
@@ -611,7 +684,113 @@ def plot_fig8_garch(train_index, residuals, garch_res, save_dir='.'):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8 — MAIN
+# SECTION 8 — EXCEL EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_excel(df, df_train, df_eval, forecasts, bench_metrics,
+                 rolling_metrics, h_rmse, garch_res, save_dir='.'):
+    """
+    Export results to cic_forecast_output.xlsx with sheets:
+      1. Daily_Forecasts  — actual CIC level + Change + forecast series (Change & CIC)
+      2. Benchmark_Metrics — RMSE / MAE / ResidSD / Bias for each model
+      3. Rolling_RMSE     — expanding-window RMSE across backtest periods
+      4. Horizon_RMSE     — RMSE at h=1,5,10,22 trading-day horizons
+      5. GARCH_Params     — GARCH(1,1) parameter estimates
+      6. Training_Data    — underlying time series used in model (for plots)
+    """
+    path = os.path.join(save_dir, 'cic_forecast_output.xlsx')
+
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+
+        # Sheet 1: Daily forecasts (eval window + full series)
+        out = df[['Currency', 'Change']].copy()
+        out.columns = ['CIC_Level', 'Change_Actual']
+
+        # Forecast Change for eval window
+        for mname, pred in forecasts.items():
+            col = f'{MODEL_LABELS[mname]}_Change_fc'
+            out.loc[df_eval.index, col] = pred
+
+        # Reconstruct forecast CIC level for eval window
+        for mname, pred in forecasts.items():
+            col_fc  = f'{MODEL_LABELS[mname]}_CIC_fc'
+            cic_fc  = np.full(len(df_eval), np.nan)
+            cic_start = df.loc[df_eval.index[0], 'Currency']
+            # CIC_fc[0] = CIC_actual[0] + change_forecast[0]
+            last_cic = df.loc[df.index[df.index.get_loc(df_eval.index[0]) - 1], 'Currency']
+            for j, p in enumerate(pred):
+                cic_fc[j] = last_cic + p
+                last_cic  = cic_fc[j]
+            out.loc[df_eval.index, col_fc] = cic_fc
+
+        out.index.name = 'Date'
+        out.reset_index().to_excel(writer, sheet_name='Daily_Forecasts', index=False)
+
+        # Sheet 2: Benchmark metrics
+        rows = []
+        for mname, m in bench_metrics.items():
+            rows.append({
+                'Model': MODEL_LABELS[mname],
+                'RMSE (THB bn)': round(m['RMSE'], 4),
+                'MAE (THB bn)':  round(m['MAE'],  4),
+                'ResidSD':       round(m['ResidSD'], 4),
+                'Bias':          round(m['Bias'],    4),
+                'n obs':         m['n'],
+            })
+        rows.append({'Model': '[BOT 2022 paper]', 'RMSE (THB bn)': 4.960,
+                     'MAE (THB bn)': None, 'ResidSD': 4.140, 'Bias': None, 'n obs': None})
+        rows.append({'Model': '[Pre-2022 model]', 'RMSE (THB bn)': 7.310,
+                     'MAE (THB bn)': None, 'ResidSD': 4.750, 'Bias': None, 'n obs': None})
+        pd.DataFrame(rows).to_excel(writer, sheet_name='Benchmark_Metrics', index=False)
+
+        # Sheet 3: Rolling RMSE
+        roll_rows = []
+        all_windows = []
+        for mname, wdict in rolling_metrics.items():
+            all_windows = list(wdict.keys())
+            break
+        for mname, wdict in rolling_metrics.items():
+            row = {'Model': MODEL_LABELS[mname]}
+            for wl in all_windows:
+                rmse = wdict.get(wl, {}).get('RMSE', np.nan)
+                row[wl] = round(float(rmse), 4) if not np.isnan(rmse) else None
+            roll_rows.append(row)
+        pd.DataFrame(roll_rows).to_excel(writer, sheet_name='Rolling_RMSE', index=False)
+
+        # Sheet 4: Horizon RMSE
+        horizons = [1, 5, 10, 22]
+        h_rows = []
+        for mname, hdict in h_rmse.items():
+            row = {'Model': MODEL_LABELS[mname]}
+            for h in horizons:
+                val = hdict.get(h, np.nan)
+                row[f'h={h}d'] = round(float(val), 4) if not np.isnan(val) else None
+            h_rows.append(row)
+        pd.DataFrame(h_rows).to_excel(writer, sheet_name='Horizon_RMSE', index=False)
+
+        # Sheet 5: GARCH params
+        gp = garch_res.params
+        garch_rows = [
+            {'Parameter': 'omega',    'Value': round(float(gp['omega']),    6)},
+            {'Parameter': 'alpha[1]', 'Value': round(float(gp['alpha[1]']), 6)},
+            {'Parameter': 'beta[1]',  'Value': round(float(gp['beta[1]']),  6)},
+            {'Parameter': 'persistence', 'Value': round(float(gp['alpha[1]'] + gp['beta[1]']), 6)},
+            {'Parameter': 'AIC',      'Value': round(float(garch_res.aic),   2)},
+            {'Parameter': 'BIC',      'Value': round(float(garch_res.bic),   2)},
+        ]
+        pd.DataFrame(garch_rows).to_excel(writer, sheet_name='GARCH_Params', index=False)
+
+        # Sheet 6: Training data (for plots / verification)
+        train_out = df_train[['Currency', 'Change']].copy()
+        train_out.columns = ['CIC_Level', 'Change']
+        train_out.index.name = 'Date'
+        train_out.reset_index().to_excel(writer, sheet_name='Training_Data', index=False)
+
+    print(f'  Saved → ./cic_forecast_output.xlsx')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -629,82 +808,91 @@ def main():
 
     HORIZON_ORIGINS = ['2021-12-01', '2022-02-01', '2022-04-01']
     ALL_MODELS  = list(REGS.keys())
-    CORE_MODELS = ['Old_2022', 'Regime']
+    CORE_MODELS = ['Old_2022', 'ExtDummy']
 
     sep = '=' * 65
     print(sep)
-    print('  CIC FORECASTING — OLD vs. NEW  (Bank of Thailand)')
+    print('  CIC FORECASTING — OLD vs. NEW MODELS  (Bank of Thailand)')
     print(sep)
 
     # 1. Load
     print('\n[1] Loading data...')
     df = load_data(FILEPATH)
-    print(f'    {len(df)} obs  |  {df.index[0].date()} → {df.index[-1].date()}')
-    adf_s, adf_p, *_ = adfuller(df['Change'], autolag='AIC')
-    print(f'    Change: mean={df["Change"].mean():.3f}  std={df["Change"].std():.3f}  '
-          f'ADF p={adf_p:.4f} → {"stationary ✓" if adf_p<0.05 else "non-stationary ⚠"}')
+    print(f'    Obs: {len(df)} | {df.index[0].date()} → {df.index[-1].date()}')
+    chg = df['Change'].dropna()
+    print(f'    Change: mean={chg.mean():.3f}  std={chg.std():.3f}  '
+          f'min={chg.min():.3f}  max={chg.max():.3f} (THB bn)')
+    adf_s, adf_p, *_ = adfuller(chg, autolag='AIC')
+    print(f'    ADF test: stat={adf_s:.3f}, p={adf_p:.4f}  → '
+          f'{"stationary ✓" if adf_p<0.05 else "non-stationary ⚠"}')
 
     df_train = df.loc[:TRAIN_END]
     df_eval  = df.loc[EVAL_START:EVAL_END]
-    print(f'    Train {len(df_train)} obs  |  Eval {len(df_eval)} obs')
+    print(f'\n    Train: {len(df_train)} obs  ({df_train.index[0].date()} → {df_train.index[-1].date()})')
+    print(f'    Eval (benchmark): {len(df_eval)} obs  ({EVAL_START} → {EVAL_END})')
+
+    # Verify SK/NY dummies were built
+    sk_pre1_tr = int(df_train['D_SK_PRE1'].sum()) if 'D_SK_PRE1' in df_train.columns else 0
+    ny_pre1_tr = int(df_train['D_NY_PRE1'].sum()) if 'D_NY_PRE1' in df_train.columns else 0
+    print(f'    D_SK_PRE1 (train): {sk_pre1_tr} events  |  D_NY_PRE1 (train): {ny_pre1_tr} events')
 
     # 2. Fig 1
-    print('\n[2] Figure 1 — overview...')
+    print('\n[2] Figure 1 — CIC overview...')
     plot_fig1_overview(df)
 
     # 3. Fit all models
-    print('\n[3] Fitting all models (two-step ARIMAX)...')
-    print(f'  {"Model":<22}  {"AIC":>10}  {"BIC":>10}  σ      AR      MA')
-    print('  ' + '-' * 60)
+    print('\n[3] Fitting all models on training data...')
+    print(f'  {"Model":<20} {"AIC":>10} {"BIC":>10} {"LogL":>10}  σ      AR     MA')
+    print('  ' + '-' * 70)
     fitted_models = {}
     for mname in ALL_MODELS:
         X_tr, _ = get_X(df_train, mname)
         mdl = TwoStepARIMAX().fit(df_train['Change'].values, X_tr)
         fitted_models[mname] = mdl
-        print(f'  {MODEL_LABELS[mname]:<22}  {mdl.aic:>10.1f}  {mdl.bic:>10.1f}  '
-              f'{mdl.sigma:.3f}  {mdl.ar1:.3f}   {mdl.ma1:.3f}')
+        print(f'  [{mname:<16}]  AIC={mdl.aic:9.1f}  BIC={mdl.bic:9.1f}  '
+              f'LogL={mdl._logL:9.1f}  σ={mdl.sigma:.3f}  AR={mdl.ar1:.3f}  MA={mdl.ma1:.3f}')
 
     # 4. Benchmark forecasts
-    print('\n[4] Benchmark forecasts...')
+    print('\n[4] Benchmark forecasts (Dec-2021 → May-2022)...')
     forecasts = {}
     for mname, mdl in fitted_models.items():
         X_ev, _ = get_X(df_eval, mname)
         forecasts[mname] = mdl.forecast(X_ev)
+        print(f'  {mname}: {len(forecasts[mname])} forecast steps generated')
 
     # 5. Benchmark metrics
-    print('\n[5] Benchmark metrics (Dec-2021 → May-2022):')
-    print(f'  {"Model":<24}  {"RMSE":>7}  {"MAE":>7}  {"ResidSD":>9}  {"Bias":>7}')
-    print('  ' + '-' * 58)
+    print('\n[5] Benchmark window metrics (Dec-2021 → May-2022):')
+    print(f'  {"Model":<24} {"RMSE":>8} {"MAE":>8} {"ResidSD":>10}')
+    print('  ' + '-' * 52)
     bench_metrics = {}
     actual_arr = df_eval['Change'].values
     for mname, pred in forecasts.items():
         m = compute_metrics(actual_arr, pred)
         bench_metrics[mname] = m
-        print(f'  {MODEL_LABELS[mname]:<24}  {m["RMSE"]:>7.3f}  {m["MAE"]:>7.3f}  '
-              f'{m["ResidSD"]:>9.3f}  {m["Bias"]:>7.3f}')
-    print(f'  {"[BOT 2022 paper]":<24}  {"4.960":>7}  {"---":>7}  {"4.140":>9}  {"---":>7}  (published)')
-    print(f'  {"[Pre-2022 model]":<24}  {"7.310":>7}  {"---":>7}  {"4.750":>9}  {"---":>7}  (published)')
+        print(f'  {MODEL_LABELS[mname]:<24} {m["RMSE"]:>8.3f} {m["MAE"]:>8.3f} {m["ResidSD"]:>10.3f}')
+    print(f'  {"[BOT 2022 paper]":<24} {"4.960":>8} {"---":>8} {"4.140":>10}  (published)')
+    print(f'  {"[Pre-2022 model]":<24} {"7.310":>8} {"---":>8} {"4.750":>10}  (published)')
 
     # 6. Diagnostics
-    print('\n[6] Residual diagnostics...')
+    print('\n[6] Residual diagnostics (training residuals)...')
     residuals = {mname: mdl.resid for mname, mdl in fitted_models.items()}
     for mname, res in residuals.items():
         run_diagnostics(res, label=MODEL_LABELS[mname])
 
     # 7. ARCH + GARCH
-    print('\n[7] ARCH-LM test + GARCH(1,1) on Old_2022 residuals...')
+    print('\n[7] ARCH-LM + GARCH(1,1) on Old_2022 residuals...')
     old_res = np.asarray(residuals['Old_2022'], dtype=float)
     old_res = old_res[~np.isnan(old_res)]
     arch_stat, arch_pval, _, _ = het_arch(old_res, nlags=10)
-    print(f'  ARCH-LM(10): stat={arch_stat:.3f}  p={arch_pval:.4f}  '
-          f'→ {"⚠ ARCH effects confirmed" if arch_pval<0.05 else "✓ no ARCH effects"}')
+    print(f'  ARCH-LM(10): stat={arch_stat:.3f}, p={arch_pval:.4f}  '
+          f'→ {"⚠ ARCH effects present — GARCH warranted" if arch_pval<0.05 else "✓ no ARCH effects"}')
     garch_res = fit_garch(old_res)
 
     # 8. Rolling backtest
-    print('\n[8] Rolling backtest (expanding window)...')
+    print('\n[8] Rolling backtest (expanding window, 4 periods)...')
     rolling_metrics = rolling_backtest(df, CORE_MODELS, BACKTEST_WINDOWS)
 
-    print('\n  Rolling RMSE:')
+    print('\n  Rolling RMSE summary:')
     win_labels = [f'{es[:7]}→{ee[:7]}' for _, es, ee in BACKTEST_WINDOWS]
     hdr = f'  {"Model":<24}' + ''.join(f'{w:>22}' for w in win_labels)
     print(hdr)
@@ -717,10 +905,10 @@ def main():
         print(row)
 
     # 9. Horizon RMSE
-    print('\n[9] Horizon RMSE (1, 5, 10, 22-day ahead)...')
+    print('\n[9] Horizon RMSE (1, 5, 10, 22-day ahead, 3 monthly origins)...')
     h_rmse = horizon_rmse_monthly(df, CORE_MODELS, HORIZON_ORIGINS)
     print('\n  Horizon RMSE:')
-    print(f'  {"Model":<24}  {"h=1":>8}  {"h=5":>8}  {"h=10":>8}  {"h=22":>8}')
+    print(f'  {"Model":<24} {"h=1":>8} {"h=5":>8} {"h=10":>8} {"h=22":>8}')
     print('  ' + '-' * 60)
     for mname in CORE_MODELS:
         row = f'  {MODEL_LABELS[mname]:<24}'
@@ -729,8 +917,8 @@ def main():
             row += f'  {val:>8.3f}'
         print(row)
 
-    # 10. All figures
-    print('\n[10] Generating figures...')
+    # 10. Figures
+    print('\n[10] Generating all figures...')
     plot_fig2_actual_vs_forecast(df_eval, forecasts)
     plot_fig3_errors(df_eval, forecasts)
     plot_fig4_residuals(residuals)
@@ -740,27 +928,39 @@ def main():
     plot_fig7_monthly_monitor(df_eval, forecasts)
     plot_fig8_garch(df_train.index, old_res, garch_res)
 
-    # 11. Final summary
+    # 11. Excel export
+    print('\n[11] Exporting Excel output...')
+    export_excel(df, df_train, df_eval, forecasts, bench_metrics,
+                 rolling_metrics, h_rmse, garch_res)
+
+    # Final summary
     print('\n' + sep)
     print('  FINAL RESULTS — BENCHMARK WINDOW (Dec-2021 → May-2022)')
     print(sep)
     paper_rmse = 4.96
     old_rmse   = bench_metrics['Old_2022']['RMSE']
-    print(f'\n  {"Model":<26}  {"RMSE":>7}  {"Δ vs Old_2022":>14}  {"Δ vs paper":>12}')
-    print('  ' + '-' * 63)
+    print(f'\n  {"Model":<28} {"RMSE":>6} {"vs Old_2022":>13} {"vs BOT paper":>13}')
+    print('  ' + '-' * 62)
+    best_name = min(bench_metrics, key=lambda k: bench_metrics[k]['RMSE'])
     for mname in ALL_MODELS:
         r   = bench_metrics[mname]['RMSE']
-        tag = ' ← best' if r == min(m['RMSE'] for m in bench_metrics.values()) else ''
-        print(f'  {MODEL_LABELS[mname]:<26}  {r:>7.3f}  '
-              f'{r-old_rmse:>+14.3f}  {r-paper_rmse:>+12.3f}{tag}')
-    print(f'  {"[BOT 2022 paper]":<26}  {"4.960":>7}  {"baseline":>14}  {"0.000":>12}')
-    print(f'  {"[Pre-2022 model]":<26}  {"7.310":>7}  {"":>14}  {"+2.350":>12}')
+        tag = ' ← best' if mname == best_name else ''
+        d_old   = r - old_rmse
+        d_paper = r - paper_rmse
+        s_old   = '+' if d_old >= 0 else ''
+        s_pap   = '+' if d_paper >= 0 else ''
+        print(f'  {MODEL_LABELS[mname]:<28} {r:>6.3f}  {s_old}{d_old:>10.3f}  '
+              f'{s_pap}{d_paper:>10.3f}{tag}')
+    print(f'  {"[BOT 2022 paper]":<28} {"4.960":>6}  {"baseline":>13}  {"0.000":>13}')
+    print(f'  {"[Pre-2022 model]":<28} {"7.310":>6}  {"":>13}  {"+2.350":>13}')
 
-    best = min(bench_metrics, key=lambda k: bench_metrics[k]['RMSE'])
-    print(f'\n  Recommended model: {MODEL_LABELS[best]}')
-    print(f'  RMSE: {bench_metrics[best]["RMSE"]:.3f} THB bn  '
-          f'(improvement vs BOT paper: {paper_rmse - bench_metrics[best]["RMSE"]:+.3f} THB bn)')
-    print(f'\n  Figures saved to: {os.path.abspath(".")}')
+    best_rmse = bench_metrics[best_name]['RMSE']
+    print(f'\n  Best model: {MODEL_LABELS[best_name]}  (RMSE={best_rmse:.3f})')
+    print(f'  Improvement vs Old_2022 Python replication: '
+          f'{old_rmse - best_rmse:+.3f} THB bn')
+    print(f'  Improvement vs BOT 2022 paper (4.96):       '
+          f'{paper_rmse - best_rmse:+.3f} THB bn')
+    print(f'\n  All figures saved to: {os.path.abspath(".")}')
     print(sep + '\n')
 
 
