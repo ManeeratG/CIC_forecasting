@@ -736,17 +736,18 @@ def plot_fig2_actual_vs_forecast(df_eval, forecast_dict, train_label, save_dir='
     ax.plot(dates, actual, color='#333333', lw=1.5, label='Actual', zorder=5)
     for mname, pred in forecast_dict.items():
         rmse = np.sqrt(np.mean((actual - pred)**2))
-        lw   = 1.8 if mname == 'ExtDummy' else 1.1
+        lw   = 2.0 if mname == 'D1' else (1.8 if mname == 'ExtDummy' else 1.1)
         ax.plot(dates, pred, color=COLORS.get(mname, 'grey'), lw=lw, alpha=0.8,
-                label=f'{model_label(mname, train_label)}  RMSE={rmse:.3f}')
+                label=f'{BASE_LABELS.get(mname, mname)}  RMSE={rmse:.3f}')
     ax.axhline(0, color='black', lw=0.5, ls='--')
-    for ms in pd.date_range(dates[0].strftime('%Y-%m-01'), dates[-1], freq='MS'):
-        ax.axvline(pd.Timestamp(ms), color='grey', lw=0.4, ls=':')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b\n%Y'))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    for ms in pd.date_range(dates[0].replace(day=1), dates[-1], freq='YS'):
+        ax.axvline(pd.Timestamp(ms), color='grey', lw=0.6, ls=':')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.set_ylabel('Daily CIC Change (THB billion)', fontsize=11)
     eval_desc = f'{dates[0].strftime("%b %Y")} → {dates[-1].strftime("%b %Y")}'
-    ax.set_title(f'Actual vs. Forecast — {eval_desc}', fontsize=13, fontweight='bold')
+    ax.set_title(f'Actual vs. Forecast — Daily ΔCIC  ({eval_desc})', fontsize=13, fontweight='bold')
+    ax.set_xlabel(f'Train: {train_label}  |  OOS: {eval_desc}', fontsize=9, color='dimgrey')
     ax.legend(fontsize=9, loc='upper right')
     ax.grid(axis='y', alpha=0.25)
     fig.tight_layout()
@@ -767,7 +768,7 @@ def plot_fig3_errors(df_eval, forecast_dict, train_label, save_dir='.'):
         ax   = axes[i, 0]
         ax.bar(dates, err, color=col, alpha=0.65, width=1.5)
         ax.axhline(0, color='black', lw=0.7)
-        ax.set_title(f'{model_label(mname, train_label)} — Error (RMSE={rmse:.3f} THB bn)', fontsize=10)
+        ax.set_title(f'{BASE_LABELS.get(mname, mname)} — Error (RMSE={rmse:.3f} THB bn)', fontsize=10)
         ax.set_ylabel('Error (THB bn)')
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
         ax.xaxis.set_major_locator(mdates.MonthLocator())
@@ -779,6 +780,9 @@ def plot_fig3_errors(df_eval, forecast_dict, train_label, save_dir='.'):
         ax.set_title('Error Distribution', fontsize=10)
         ax.set_xlabel('Error (THB bn)')
         ax.legend(fontsize=8)
+    eval_desc = f'{dates[0].strftime("%b %Y")} → {dates[-1].strftime("%b %Y")}'
+    fig.suptitle(f'Forecast Errors  |  Train: {train_label}  |  OOS: {eval_desc}',
+                 fontsize=9, color='dimgrey', y=1.01)
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig3_forecast_errors.png')
 
@@ -800,62 +804,71 @@ def plot_fig4_residuals(residuals_dict, train_label, save_dir='.'):
         ax.axhline(conf,  color='red', ls='--', lw=0.8)
         ax.axhline(-conf, color='red', ls='--', lw=0.8)
         ax.axhline(0, color='black', lw=0.5)
-        ax.set_title(f'{model_label(mname, train_label)}\nResidual ACF', fontsize=10)
+        ax.set_title(f'{BASE_LABELS.get(mname, mname)}\nResidual ACF', fontsize=10)
         ax.set_xlabel('Lag')
         ax = axes[i, 1]
         (osm, osr), (slope, intercept, _) = stats.probplot(res, dist='norm')
         ax.scatter(osm, osr, s=6, alpha=0.5, color=col)
         ax.plot(osm, slope * np.array(osm) + intercept, 'r-', lw=1.5)
-        ax.set_title(f'{model_label(mname, train_label)}\nNormal Q-Q', fontsize=10)
+        ax.set_title(f'{BASE_LABELS.get(mname, mname)}\nNormal Q-Q', fontsize=10)
         ax.set_xlabel('Theoretical quantiles')
         ax.set_ylabel('Sample quantiles')
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig4_residual_diagnostics.png')
 
 
-def plot_fig5_rmse_comparison(all_bench, rolling_metrics, save_dir='.'):
-    """all_bench = list of (label, rmse) for all model-config combos."""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+def plot_fig5_rmse_comparison(all_bench, rolling_metrics, eval_period_label='', save_dir='.'):
+    """
+    all_bench = list of (model_name, rmse, color) for cfg_main only.
+    LHS: daily RMSE bars for the main OOS period.
+    RHS: 7-window rolling backtest for all 4 ARIMAX models.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
+    # LHS — RMSE bars, cfg_main OOS only
     ax = axes[0]
-    labels = [x[0] for x in all_bench]
+    labels = [BASE_LABELS.get(x[0], x[0]) for x in all_bench]
     rmsev  = [x[1] for x in all_bench]
     colors = [x[2] for x in all_bench]
     bars   = ax.bar(range(len(labels)), rmsev, color=colors, alpha=0.85)
-    ax.axhline(4.96, color='black', ls='--', lw=1.8, label='BOT 2022 paper (2017-2021): 4.96')
+    ax.axhline(4.96, color='black', ls='--', lw=1.8, label='BOT 2022 paper baseline: 4.96')
     ax.axhline(7.31, color='grey',  ls=':',  lw=1.5, label='Pre-2022 model: 7.31')
     for bar, val in zip(bars, rmsev):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                f'{val:.3f}', ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=8)
-    ax.set_ylabel('RMSE (THB billion)', fontsize=11)
-    ax.set_title('RMSE — Benchmark Window (Dec 2021 → May 2022)',
+    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=9)
+    ax.set_ylabel('Daily ΔCIC RMSE (THB billion)', fontsize=11)
+    ax.set_title(f'Daily Forecast RMSE — OOS Period\n{eval_period_label}',
                  fontsize=12, fontweight='bold')
     ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     ax.set_ylim(0, max(8.5, max(rmsev) * 1.2))
 
+    # RHS — 7-window rolling backtest, all 4 ARIMAX models
     ax = axes[1]
-    compare   = [m for m in ['Old_2022', 'ExtDummy'] if m in rolling_metrics]
+    compare    = [m for m in ['Old_2022', 'ExtDummy', 'Regime', 'Fourier_Regime']
+                  if m in rolling_metrics]
     win_labels = list(next(iter(rolling_metrics.values())).keys()) if rolling_metrics else []
-    x = np.arange(len(win_labels))
-    w = 0.35
+    x  = np.arange(len(win_labels))
+    n  = len(compare)
+    w  = 0.8 / n
     for j, mname in enumerate(compare):
-        vals = [rolling_metrics[mname].get(wl, {}).get('RMSE', np.nan) for wl in win_labels]
-        bars = ax.bar(x + (j - 0.5) * w, vals, w * 0.9,
-                      color=COLORS.get(mname, 'grey'), alpha=0.85,
-                      label=BASE_LABELS[mname])
+        vals   = [rolling_metrics[mname].get(wl, {}).get('RMSE', np.nan) for wl in win_labels]
+        offset = (j - n / 2 + 0.5) * w
+        bars   = ax.bar(x + offset, vals, w * 0.9,
+                        color=COLORS.get(mname, 'grey'), alpha=0.85,
+                        label=BASE_LABELS[mname])
         for bar, val in zip(bars, vals):
             if not np.isnan(val):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                        f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=7)
     ax.set_xticks(x)
-    ax.set_xticklabels([wl.replace('→', '\n→\n') for wl in win_labels], fontsize=8)
-    ax.set_ylabel('RMSE (THB billion)', fontsize=11)
-    ax.set_title('Rolling Backtest RMSE\n(Expanding Window)',
+    ax.set_xticklabels([wl[:7] + '\n→' + wl[10:] for wl in win_labels], fontsize=8)
+    ax.set_ylabel('Daily ΔCIC RMSE (THB billion)', fontsize=11)
+    ax.set_title('Rolling Backtest RMSE — All Years\n(Expanding window, 1-year OOS each)',
                  fontsize=12, fontweight='bold')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig5_rmse_comparison.png')
@@ -869,7 +882,7 @@ def plot_fig6_horizon(h_rmse_dict, train_label, save_dir='.'):
         vals = [hdict[h] for h in hs]
         ax.plot(hs, vals, marker=markers[i % len(markers)],
                 color=COLORS.get(mname, 'grey'), lw=2.2, ms=10,
-                label=model_label(mname, train_label))
+                label=BASE_LABELS.get(mname, mname))
         for h, r in zip(hs, vals):
             if not np.isnan(r):
                 ax.annotate(f'{r:.2f}', (h, r), xytext=(5, 5),
@@ -880,6 +893,7 @@ def plot_fig6_horizon(h_rmse_dict, train_label, save_dir='.'):
     ax.set_ylabel('RMSE (THB billion)', fontsize=11)
     ax.set_title('Forecast Accuracy vs Horizon\n(3 Monthly Origins)',
                  fontsize=13, fontweight='bold')
+    ax.set_xlabel('Train: 1997–2019  |  OOS: Jan 2020 – May 2026', fontsize=9, color='dimgray')
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -898,12 +912,13 @@ def plot_fig7_monthly_monitor(df_eval, forecast_dict, train_label, save_dir='.')
         common  = monthly_actual.index.intersection(pred_s.index)
         ax.plot(common, pred_s.loc[common].values,
                 color=COLORS.get(mname, 'grey'), marker='o', lw=2, ms=8,
-                label=model_label(mname, train_label))
+                label=BASE_LABELS.get(mname, mname))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
     ax.set_ylabel('Monthly CIC Change (THB bn)', fontsize=11)
     ax.set_title('Monthly Aggregated CIC Change\nActual vs Forecast', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Train: 1997–2019  |  OOS: last 2 years shown', fontsize=9, color='dimgray')
     ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     ax = axes[1]
@@ -914,7 +929,8 @@ def plot_fig7_monthly_monitor(df_eval, forecast_dict, train_label, save_dir='.')
         if len(common):
             e = monthly_actual.loc[common] - pred_s.loc[common]
             monthly_rmse[mname] = np.sqrt(np.mean(e**2))
-    bars = ax.bar([model_label(m, train_label) for m in monthly_rmse],
+    bar_labels = [BASE_LABELS.get(m, m) for m in monthly_rmse]
+    bars = ax.bar(bar_labels,
                   list(monthly_rmse.values()),
                   color=[COLORS.get(m, 'grey') for m in monthly_rmse], alpha=0.85)
     for bar, val in zip(bars, monthly_rmse.values()):
@@ -922,8 +938,7 @@ def plot_fig7_monthly_monitor(df_eval, forecast_dict, train_label, save_dir='.')
                 f'{val:.1f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
     ax.set_ylabel('Monthly RMSE (THB billion)', fontsize=11)
     ax.set_title('Monthly Monitor Accuracy', fontsize=12, fontweight='bold')
-    ax.set_xticklabels([model_label(m, train_label) for m in monthly_rmse],
-                        rotation=15, ha='right', fontsize=8)
+    ax.set_xticklabels(bar_labels, rotation=15, ha='right', fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig7_monthly_monitor.png')
@@ -957,17 +972,16 @@ def plot_fig8_garch(train_index, residuals, garch_res, save_dir='.'):
     _save(fig, save_dir, 'fig8_garch_volatility.png')
 
 
-def plot_fig9_seasonal_cic(df, fitted_model, hol, save_dir='.'):
+def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     """
     Seasonal CIC pattern: monthly end-of-month CIC level by year.
     Y-axis  : CIC level (THB billion)
     X-axis  : Month (Jan–Dec)
-    Lines   : each year (last 10 years highlighted)
-    Dot     : next-month forecast CIC level
+    Lines   : each year (last 10 years highlighted, older years faded)
+    Fan     : 3-model forecast fan — Old_2022, ExtDummy, D1 — with shaded range
     """
-    df_lev   = df[df['Currency'].notna()].copy()
-    eom      = df_lev['Currency'].resample('ME').last()
-    eom      = eom.dropna()
+    df_lev = df[df['Currency'].notna()].copy()
+    eom    = df_lev['Currency'].resample('ME').last().dropna()
 
     pivot = pd.DataFrame({'month': eom.index.month,
                           'year':  eom.index.year,
@@ -991,32 +1005,58 @@ def plot_fig9_seasonal_cic(df, fitted_model, hol, save_dir='.'):
                 color=cmap_colors[i], marker='o', ms=4,
                 label=str(yr), **style)
 
-    # Forecast dot: next month from last available data
+    # Fan chart: 3 model forecasts shown as lines + shaded range
     last_date = df_lev.index.max()
     last_cic  = df_lev['Currency'].iloc[-1]
-
-    # Forecast the next ~30 business days after last data point
     fc_start  = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
     fc_end    = (last_date + pd.Timedelta(days=45)).strftime('%Y-%m-%d')
-    try:
-        X_fut = generate_future_exog('ExtDummy', fc_start, fc_end, hol)
-        if len(X_fut) > 0:
-            fc_change = fitted_model.forecast(X_fut.values)
-            # Reconstruct CIC level
-            cic_fc = last_cic
-            eom_forecasts = {}
-            for j, (dt, chg) in enumerate(zip(X_fut.index, fc_change)):
-                cic_fc += chg
-                mo = dt.month
-                yr = dt.year
-                eom_forecasts[(yr, mo)] = cic_fc  # keep updating → last day = EOM
 
-            for (yr, mo), val in eom_forecasts.items():
-                ax.scatter(mo, val, s=180, zorder=10,
-                           color='gold', edgecolors='black', linewidths=1.5,
-                           marker='*', label=f'Forecast ({pd.Timestamp(yr, mo, 1).strftime("%b %Y")})')
-    except Exception as e:
-        print(f'  (Forecast dot skipped: {e})')
+    fan_models = {k: v for k, v in fitted_models_dict.items()
+                  if k in ('Old_2022', 'ExtDummy', 'D1')}
+    fan_fc = {}  # mname -> {(yr, mo): eom_level}
+
+    for mname, mdl in fan_models.items():
+        try:
+            X_fut = generate_future_exog('Old_2022' if mname == 'D1' else mname,
+                                         fc_start, fc_end, hol)
+            if len(X_fut) == 0:
+                continue
+            fc_change = mdl.forecast(X_fut.values)
+            cic_fc = last_cic
+            eom_fc = {}
+            for dt, chg in zip(X_fut.index, fc_change):
+                cic_fc += chg
+                eom_fc[(dt.year, dt.month)] = cic_fc
+            fan_fc[mname] = eom_fc
+        except Exception as e:
+            print(f'  (Fan forecast skipped for {mname}: {e})')
+
+    if fan_fc:
+        # Collect all forecast points for the fan
+        all_keys = set()
+        for eom_fc in fan_fc.values():
+            all_keys.update(eom_fc.keys())
+        for yr_mo in sorted(all_keys):
+            mo = yr_mo[1]
+            vals = [fan_fc[m][yr_mo] for m in fan_models if yr_mo in fan_fc.get(m, {})]
+            if len(vals) >= 2:
+                ax.fill_between([mo - 0.05, mo + 0.05],
+                                [min(vals), min(vals)], [max(vals), max(vals)],
+                                color='gold', alpha=0.35, zorder=8)
+
+        fan_label_map = {'Old_2022': 'Old_2022 fc', 'ExtDummy': 'ExtDummy fc', 'D1': 'D1 fc'}
+        fan_markers   = {'Old_2022': 's', 'ExtDummy': '^', 'D1': 'D'}
+        for mname in ('Old_2022', 'ExtDummy', 'D1'):
+            eom_fc = fan_fc.get(mname, {})
+            if not eom_fc:
+                continue
+            xs = [k[1] for k in sorted(eom_fc)]
+            ys = [eom_fc[k] for k in sorted(eom_fc)]
+            ax.scatter(xs, ys, s=160, zorder=10,
+                       color=COLORS.get(mname, 'gold'),
+                       edgecolors='black', linewidths=1.2,
+                       marker=fan_markers[mname],
+                       label=fan_label_map[mname])
 
     month_names = ['Jan','Feb','Mar','Apr','May','Jun',
                    'Jul','Aug','Sep','Oct','Nov','Dec']
@@ -1024,11 +1064,11 @@ def plot_fig9_seasonal_cic(df, fitted_model, hol, save_dir='.'):
     ax.set_xticklabels(month_names, fontsize=11)
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year\n'
-                 '(★ = next-month forecast from ExtDummy model)',
+                 '(★ shaded = forecast range across Old_2022, ExtDummy, D1)',
                  fontsize=13, fontweight='bold')
-    ax.legend(fontsize=8.5, ncol=2, loc='upper left',
+    ax.legend(fontsize=8.5, ncol=1, loc='upper left',
               bbox_to_anchor=(1.01, 1), borderaxespad=0,
-              title='Year', title_fontsize=9)
+              title='Year / Model', title_fontsize=9)
     ax.grid(alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
     fig.tight_layout()
@@ -1583,14 +1623,12 @@ def main():
     # fig4 — Residual ACF/QQ on cfg_main training residuals (ARIMAX only)
     plot_fig4_residuals(residuals, m_lbl)
 
-    # fig5 — RMSE comparison bars: both configs + rolling backtest
+    # fig5 — RMSE comparison bars: cfg_main only + rolling backtest
     all_bench = []
-    for cfg_data in configs_results.values():
-        lbl = cfg_data['train_label']
-        for mname, m in cfg_data['bench_metrics'].items():
-            label_str = model_label(mname, lbl) if mname != 'D1' else f'D1 ({lbl})'
-            all_bench.append((label_str, m['RMSE'], COLORS.get(mname, '#aaaaaa')))
-    plot_fig5_rmse_comparison(all_bench, rolling_metrics)
+    for mname, m in configs_results['cfg_main']['bench_metrics'].items():
+        all_bench.append((BASE_LABELS.get(mname, mname), m['RMSE'], COLORS.get(mname, '#aaaaaa')))
+    eval_period_label = 'Train: 1997–2019  |  OOS: Jan 2020 – May 2026'
+    plot_fig5_rmse_comparison(all_bench, rolling_metrics, eval_period_label=eval_period_label)
 
     plot_fig6_horizon(h_rmse, m_data['train_label'])
 
@@ -1599,8 +1637,9 @@ def main():
 
     plot_fig8_garch(m_data['df_train'].index, old_res, garch_res)
 
-    print('  Generating fig9 (seasonal CIC)...')
-    plot_fig9_seasonal_cic(df, m_fitted['ExtDummy'], hol)
+    print('  Generating fig9 (seasonal CIC + 3-model fan chart)...')
+    fan_models_dict = {k: m_fitted[k] for k in ('Old_2022', 'ExtDummy', 'D1') if k in m_fitted}
+    plot_fig9_seasonal_cic(df, fan_models_dict, hol)
 
     # fig10 — D1 adaptive drift
     if ss_d1 is not None:
