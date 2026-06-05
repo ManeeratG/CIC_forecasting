@@ -32,6 +32,7 @@ from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import adfuller, acf
 from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
+from statsmodels.tsa.statespace.structural import UnobservedComponents
 from arch import arch_model
 
 np.random.seed(42)
@@ -398,6 +399,83 @@ class TwoStepARIMAX:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4b — STATE-SPACE TREND MODEL (Model D)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StateSpaceTrendModel:
+    """
+    Model D: adaptive-drift forecaster — two-step state-space.
+
+    Step 1: OLS on the same calendar dummy matrix as Old_2022 (concentrates out
+            regression betas analytically, same as TwoStepARIMAX Step 1).
+    Step 2: UnobservedComponents on the OLS residuals — no exog, so MLE only
+            optimises 2–3 variance parameters (20–50× faster than joint UC).
+
+    D1  — local level on ΔCIC residuals:
+            resid_t = ν_t + u_t,  ν_t = ν_{t-1} + ζ_t  (AR(1) irregular)
+          ν_t is the stochastic drift; adapts as the regime changes.
+          EOM forecast = L_last + Σ (OLS_mean + UC_level_forecast).
+
+    D2_smooth — smooth trend on CIC-level residuals:
+            resid_t = ℓ_t + b_t·t + u_t,  b_t drifts slowly (level var = 0).
+          Directly targets the end-of-month level KPI.
+          EOM forecast = terminal UC level forecast + OLS mean.
+    """
+
+    VARIANTS = {
+        'D1':        {'endog': 'change', 'level': 'local level'},
+        'D2_smooth': {'endog': 'level',  'level': 'smooth trend'},
+    }
+
+    def __init__(self, variant='D1'):
+        if variant not in self.VARIANTS:
+            raise ValueError(f'Unknown variant {variant!r}. Choose from {list(self.VARIANTS)}')
+        self.variant = variant
+        self._cfg    = self.VARIANTS[variant]
+        self.ols     = None
+        self.uc_res  = None
+        self.fitted  = None
+        self.resid   = None
+        self.aic     = self.bic = np.nan
+
+    def fit(self, y_change, X, y_level=None):
+        target = y_change if self._cfg['endog'] == 'change' else y_level
+        # Step 1 — OLS (concentrates calendar betas out of Kalman MLE)
+        self.ols      = LinearRegression(fit_intercept=True).fit(X, target)
+        ols_resid     = target - self.ols.predict(X)
+        # Step 2 — UC on residuals (2–3 variance params only → fast)
+        mod           = UnobservedComponents(
+            endog=ols_resid,
+            level=self._cfg['level'],
+            autoregressive=1,
+        )
+        self.uc_res   = mod.fit(disp=False, method='bfgs', maxiter=300)
+        self.fitted   = self.ols.predict(X) + np.asarray(self.uc_res.fittedvalues)
+        self.resid    = target - self.fitted
+        self.aic      = self.uc_res.aic
+        self.bic      = self.uc_res.bic
+        return self
+
+    def forecast(self, X_future):
+        n       = len(X_future)
+        ols_fc  = self.ols.predict(X_future)
+        uc_fc   = self.uc_res.get_forecast(steps=n)
+        return ols_fc + np.asarray(uc_fc.predicted_mean)
+
+    def smoothed_drift(self):
+        """
+        Smoothed adaptive-drift component from the UC step.
+        D1  → level state ν_t on ΔCIC residuals (= stochastic drift).
+        D2  → slope state b_t on detrended CIC level.
+        """
+        sm = self.uc_res.smoother_results.smoothed_state
+        if self.variant == 'D1':
+            return sm[0]
+        else:
+            return sm[1] if sm.shape[0] > 1 else sm[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — METRICS AND DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -491,6 +569,133 @@ def horizon_rmse_monthly(df, model_names, monthly_origins, horizons=(1, 5, 10, 2
             else:
                 h_rmse[mname][h] = np.nan
     return h_rmse
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6b — MONTH-END LEVEL BACKTEST (Model D evaluation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def month_end_eom_backtest(df, hol, start_year=2019, end_year=2025):
+    """
+    Rolling monthly backtest: primary KPI = 1-month-ahead end-of-month CIC level RMSE.
+
+    For each origin = last trading day of month M (level L_M known):
+      1. Fit Old_2022, D1, D2_smooth on data up to origin.
+      2. Forecast M+1 business days via generate_future_exog('Old_2022').
+      3. EOM level:
+           Old_2022 / D1 → L_M + Σ ΔCIC_hat
+           D2_smooth      → terminal level from UC forecast
+      4. Error = actual EOM(M+1) level − forecast.
+
+    Reports per-year RMSE and overall RMSE for each model.
+    Returns results dict for plotting.
+    """
+    variants  = ['D1', 'D2_smooth']
+    all_keys  = ['Old_2022'] + variants
+    store     = {k: {'dates': [], 'actual': [], 'forecast': []} for k in all_keys}
+
+    # All month-ends from (start_year-1)-Dec through (end_year-1)-Dec
+    origins = pd.date_range(f'{start_year - 1}-12-31', f'{end_year - 1}-12-31', freq='ME')
+
+    for origin in origins:
+        # Last trading day on or before origin
+        avail = df.index[df.index <= origin]
+        if len(avail) < 500:
+            continue
+        train_end = avail[-1]
+        df_train  = df.loc[:train_end]
+
+        # Target month: next calendar month
+        nm_start = (origin + pd.offsets.MonthBegin(1))
+        nm_end   = nm_start + pd.offsets.MonthEnd(0)
+        df_next  = df.loc[nm_start:nm_end]
+        if len(df_next) < 5:
+            continue
+
+        lev_next = df_next['Currency'].dropna()
+        if len(lev_next) == 0:
+            continue
+        actual_eom = float(lev_next.iloc[-1])
+        lev_hist   = df_train['Currency'].dropna()
+        if len(lev_hist) == 0:
+            continue
+        last_level = float(lev_hist.iloc[-1])
+
+        fc_start = df_next.index[0].strftime('%Y-%m-%d')
+        fc_end   = df_next.index[-1].strftime('%Y-%m-%d')
+        try:
+            X_fut_df = generate_future_exog('Old_2022', fc_start, fc_end, hol)
+        except Exception:
+            continue
+        if len(X_fut_df) == 0:
+            continue
+        X_fut = X_fut_df.values
+
+        X_tr_arr, _ = get_X(df_train, 'Old_2022')
+        y_chg = df_train['Change'].values
+        y_lev = df_train['Currency'].values
+
+        # Old_2022
+        try:
+            mdl = TwoStepARIMAX().fit(y_chg, X_tr_arr)
+            fc  = mdl.forecast(X_fut)
+            store['Old_2022']['dates'].append(nm_end)
+            store['Old_2022']['actual'].append(actual_eom)
+            store['Old_2022']['forecast'].append(last_level + float(fc.sum()))
+        except Exception as exc:
+            print(f'    ⚠ Old_2022 EOM {origin.date()}: {exc}')
+
+        # State-space variants
+        for v in variants:
+            try:
+                mdl = StateSpaceTrendModel(v).fit(y_chg, X_tr_arr, y_lev)
+                if v == 'D1':
+                    fc      = mdl.forecast(X_fut)
+                    fc_eom  = last_level + float(fc.sum())
+                else:
+                    fc      = mdl.forecast(X_fut)
+                    fc_eom  = float(fc[-1])
+                store[v]['dates'].append(nm_end)
+                store[v]['actual'].append(actual_eom)
+                store[v]['forecast'].append(fc_eom)
+            except Exception as exc:
+                print(f'    ⚠ {v} EOM {origin.date()}: {exc}')
+
+    # Compute errors and per-year RMSE
+    for k in all_keys:
+        r = store[k]
+        r['dates']    = pd.DatetimeIndex(r['dates'])
+        r['actual']   = np.array(r['actual'],   dtype=float)
+        r['forecast'] = np.array(r['forecast'], dtype=float)
+        r['errors']   = r['actual'] - r['forecast']
+        r['RMSE']     = np.sqrt(np.mean(r['errors'] ** 2)) if len(r['errors']) > 0 else np.nan
+
+    # Print summary
+    print(f'\n  EOM Level Backtest  ({start_year}–{end_year}):')
+    print(f'  {"Model":<16}  {"Overall RMSE":>14}  {"n":>5}')
+    print('  ' + '-' * 38)
+    for k in all_keys:
+        r = store[k]
+        print(f'  {k:<16}  {r["RMSE"]:>14.3f}  {len(r["errors"]):>5}')
+
+    # Per-year breakdown
+    report_years = list(range(start_year, end_year + 1))
+    print(f'\n  Per-year EOM RMSE:')
+    hdr = f'  {"Model":<16}' + ''.join(f'{y:>8}' for y in report_years)
+    print(hdr)
+    print('  ' + '-' * (16 + 8 * len(report_years)))
+    for k in all_keys:
+        r   = store[k]
+        row = f'  {k:<16}'
+        for yr in report_years:
+            mask = r['dates'].year == yr
+            if mask.sum() > 0:
+                row += f'{np.sqrt(np.mean(r["errors"][mask]**2)):>8.2f}'
+            else:
+                row += f'{"—":>8}'
+        print(row)
+
+    return store
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -851,12 +1056,142 @@ def plot_fig9_seasonal_cic(df, fitted_model, hol, save_dir='.'):
     _save(fig, save_dir, 'fig9_seasonal_cic.png')
 
 
+def plot_fig10_trend_slope(df_train, ss_d1_res, ss_d2_res, save_dir='.'):
+    """
+    fig10 — Smoothed adaptive drift ν_t (D1) and slope b_t (D2).
+
+    Key diagnostic: the adaptive drift must show the 2020 COVID hump and the
+    post-2021 digital-payment decline. Flat Old_2022 constant shown as baseline.
+    """
+    idx_d1 = df_train.index[:len(ss_d1_res.fitted)]
+    idx_d2 = df_train.index[:len(ss_d2_res.fitted)]
+
+    drift_d1 = ss_d1_res.smoothed_drift()[:len(idx_d1)]
+    slope_d2 = ss_d2_res.smoothed_drift()[:len(idx_d2)]
+
+    fig, axes = plt.subplots(2, 1, figsize=(15, 9), sharex=False)
+
+    # Panel 1 — D1 adaptive drift on ΔCIC
+    ax = axes[0]
+    ax.plot(idx_d1, drift_d1, color='#1f77b4', lw=1.1, label='D1 drift ν_t (local level on ΔCIC)')
+    ax.axhline(0, color='black', lw=0.6, ls='--')
+    ax.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
+               alpha=0.12, color='red', label='COVID 2020')
+    ax.axvline(pd.Timestamp('2021-01-01'), color='orange', lw=1.2, ls='--', alpha=0.8,
+               label='Digital-payment erosion starts (2021+)')
+    ax.set_ylabel('Drift on ΔCIC (THB bn/day)', fontsize=11)
+    ax.set_title('Model D1 — Smoothed Adaptive Drift ν_t on Daily ΔCIC\n'
+                 '(vs Old_2022 frozen constant ≈ flat line)',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.grid(alpha=0.25)
+
+    # Panel 2 — D2 slope on CIC level
+    ax = axes[1]
+    ax.plot(idx_d2, slope_d2, color='#d62728', lw=1.1, label='D2_smooth slope b_t (smooth trend on CIC level)')
+    ax.axhline(0, color='black', lw=0.6, ls='--')
+    ax.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
+               alpha=0.12, color='red', label='COVID 2020')
+    ax.axvline(pd.Timestamp('2021-01-01'), color='orange', lw=1.2, ls='--', alpha=0.8,
+               label='Post-2021 decline')
+    ax.set_ylabel('Trend slope b_t (THB bn/day)', fontsize=11)
+    ax.set_title('Model D2_smooth — Smoothed Slope b_t on CIC Level\n'
+                 '(positive = growth, near-zero/negative = stagnation/erosion)',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    ax.grid(alpha=0.25)
+
+    fig.tight_layout(pad=2)
+    _save(fig, save_dir, 'fig10_trend_slope.png')
+
+
+def plot_fig11_eom_level(eom_results, save_dir='.'):
+    """
+    fig11 — Actual vs forecast end-of-month CIC level across the full backtest.
+
+    Left  : time-series of actual EOM level vs Old_2022 and Model D forecasts.
+    Right : per-year RMSE bar chart — where Model D gains vs Old_2022.
+    """
+    model_colors = {
+        'Old_2022':  '#d62728',
+        'D1':        '#1f77b4',
+        'D2_smooth': '#2ca02c',
+    }
+    model_labels = {
+        'Old_2022':  'Old_2022 (frozen drift)',
+        'D1':        'Model D1 (adaptive drift, ΔCIC)',
+        'D2_smooth': 'Model D2 (smooth trend, level)',
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+    # Left — actual vs forecast level traces
+    ax = axes[0]
+    ref = eom_results.get('Old_2022', {})
+    if len(ref.get('dates', [])):
+        ax.plot(ref['dates'], ref['actual'], color='#333333', lw=2,
+                label='Actual EOM CIC Level', zorder=6)
+    for k, col in model_colors.items():
+        r = eom_results.get(k, {})
+        if len(r.get('dates', [])) == 0:
+            continue
+        rmse = r.get('RMSE', np.nan)
+        ax.plot(r['dates'], r['forecast'], color=col, lw=1.4, alpha=0.85,
+                label=f'{model_labels[k]}  (RMSE={rmse:.1f})')
+    ax.axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2020-12-31'),
+               alpha=0.10, color='red', label='COVID 2020')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.set_ylabel('EOM CIC Level (THB billion)', fontsize=11)
+    ax.set_title('End-of-Month CIC Level — Actual vs Forecast\n(1-month-ahead, rolling refit)',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
+
+    # Right — per-year RMSE bars
+    ax = axes[1]
+    ref_dates = eom_results.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
+    years = sorted(set(ref_dates.year)) if len(ref_dates) else []
+    x   = np.arange(len(years))
+    w   = 0.25
+    for j, (k, col) in enumerate(model_colors.items()):
+        r    = eom_results.get(k, {})
+        vals = []
+        for yr in years:
+            mask = r.get('dates', pd.DatetimeIndex([])).year == yr
+            if mask.sum() > 0:
+                vals.append(np.sqrt(np.mean(r['errors'][mask] ** 2)))
+            else:
+                vals.append(np.nan)
+        bars = ax.bar(x + (j - 1) * w, vals, w * 0.9, color=col, alpha=0.85,
+                      label=model_labels[k])
+        for bar, val in zip(bars, vals):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 1,
+                        f'{val:.0f}', ha='center', va='bottom', fontsize=7.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(y) for y in years], rotation=45, fontsize=9)
+    ax.set_ylabel('EOM Level RMSE (THB billion)', fontsize=11)
+    ax.set_title('1-Month-Ahead EOM Level RMSE by Year\n(lower = better)', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.grid(axis='y', alpha=0.3)
+
+    fig.tight_layout(pad=2)
+    _save(fig, save_dir, 'fig11_eom_level.png')
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9 — EXCEL EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
-                 save_dir='.'):
+                 eom_results=None, save_dir='.'):
     """
     Export results to cic_forecast_output.xlsx
 
@@ -982,6 +1317,46 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
             {'Parameter': 'BIC',         'Value': round(float(garch_res.bic), 2)},
         ]
         pd.DataFrame(garch_rows).to_excel(writer, sheet_name='GARCH_Params', index=False)
+
+        # ── Level EOM Metrics (Model D backtest) ──
+        if eom_results:
+            eom_rows = []
+            model_order = ['Old_2022', 'D1', 'D2_smooth']
+            for k in model_order:
+                r = eom_results.get(k, {})
+                if not len(r.get('dates', [])):
+                    continue
+                dates  = r['dates']
+                actual = r['actual']
+                fc     = r['forecast']
+                errs   = r['errors']
+                years  = sorted(set(dates.year))
+                base_row = {'Model': k, 'Overall_RMSE': round(r['RMSE'], 3), 'n': len(errs)}
+                for yr in years:
+                    mask = dates.year == yr
+                    if mask.sum() > 0:
+                        base_row[f'RMSE_{yr}'] = round(
+                            float(np.sqrt(np.mean(errs[mask] ** 2))), 3)
+                eom_rows.append(base_row)
+            pd.DataFrame(eom_rows).to_excel(writer, sheet_name='Level_EOM_Metrics', index=False)
+
+            # Also write detail rows (date, actual, forecast, error per model)
+            detail_frames = []
+            for k in model_order:
+                r = eom_results.get(k, {})
+                if not len(r.get('dates', [])):
+                    continue
+                tmp = pd.DataFrame({
+                    'Model':    k,
+                    'Date':     r['dates'],
+                    'Actual_EOM_Level':   r['actual'],
+                    'Forecast_EOM_Level': r['forecast'],
+                    'Error':              r['errors'],
+                })
+                detail_frames.append(tmp)
+            if detail_frames:
+                pd.concat(detail_frames).sort_values(['Date', 'Model']).to_excel(
+                    writer, sheet_name='Level_EOM_Detail', index=False)
 
     print(f'  Saved → ./cic_forecast_output.xlsx')
 
@@ -1180,6 +1555,31 @@ def main():
             row += f'  {val:>8.3f}'
         print(row)
 
+    # ── 8b. Model D — StateSpace fitting on benchmark training data (for fig10) ──
+    print('\n[8b] Fitting Model D (StateSpace) on benchmark training data...')
+    b_df_train = configs_results['cfg_benchmark']['df_train']
+    X_tr_ss, _ = get_X(b_df_train, 'Old_2022')
+    y_chg_tr   = b_df_train['Change'].values
+    y_lev_tr   = b_df_train['Currency'].values
+
+    ss_d1 = ss_d2 = None
+    for vname, endog_type in [('D1', 'change'), ('D2_smooth', 'level')]:
+        try:
+            mdl = StateSpaceTrendModel(vname).fit(y_chg_tr, X_tr_ss, y_lev_tr)
+            if vname == 'D1':
+                ss_d1 = mdl
+                print(f'  D1  AIC={mdl.aic:.1f}  BIC={mdl.bic:.1f}')
+            else:
+                ss_d2 = mdl
+                print(f'  D2_smooth AIC={mdl.aic:.1f}  BIC={mdl.bic:.1f}')
+        except Exception as exc:
+            print(f'  ⚠ {vname}: {exc}')
+
+    # ── 8c. Model D — EOM level backtest (2019-2025) ──
+    print('\n[8c] Model D — EOM level backtest (rolling monthly, 2019–2025)...')
+    print('     (This runs ~85 UC fits per variant — may take a few minutes)')
+    eom_results = month_end_eom_backtest(df, hol, start_year=2019, end_year=2025)
+
     # ── 9. Figures ──
     print('\n[9] Generating figures...')
 
@@ -1205,9 +1605,20 @@ def main():
     print('  Generating fig9 (seasonal CIC)...')
     plot_fig9_seasonal_cic(df, b_fitted['ExtDummy'], hol)
 
+    # Fig 10 — Adaptive drift/slope (Model D diagnostic)
+    if ss_d1 is not None and ss_d2 is not None:
+        print('  Generating fig10 (Model D adaptive drift)...')
+        plot_fig10_trend_slope(b_df_train, ss_d1, ss_d2)
+    else:
+        print('  ⚠ Skipping fig10 — one or both D variants failed to fit.')
+
+    # Fig 11 — EOM level actual vs forecast
+    print('  Generating fig11 (EOM level comparison)...')
+    plot_fig11_eom_level(eom_results)
+
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
-    export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res)
+    export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res, eom_results)
 
     # ── Final summary ──
     print('\n' + sep)
@@ -1235,6 +1646,26 @@ def main():
             print(f'  {model_label(mname, lbl):<36} {r:>6.3f}  {s_old}{d_old:>10.3f}  {d_pap_str:>13}{tag}')
         if cfg_key == 'cfg_benchmark':
             print(f'  {"[BOT 2022 paper (2017-2021)]":<36} {"4.960":>6}  {"baseline":>11}  {"0.000":>13}')
+
+    # EOM level RMSE summary (primary KPI for Model D)
+    print(f'\n  ── EOM Level RMSE (primary KPI — 1-month-ahead, 2019–2025) ──')
+    print(f'  {"Model":<16}  {"2024–25 RMSE":>14}  {"Overall RMSE":>14}')
+    print('  ' + '-' * 48)
+    for k in ['Old_2022', 'D1', 'D2_smooth']:
+        r = eom_results.get(k, {})
+        if not len(r.get('dates', [])):
+            continue
+        dates  = r['dates']
+        errs   = r['errors']
+        mask24 = dates.year >= 2024
+        rmse24 = np.sqrt(np.mean(errs[mask24]**2)) if mask24.sum() > 0 else np.nan
+        rmse_all = r['RMSE']
+        tag = ''
+        if k != 'Old_2022':
+            old24 = np.sqrt(np.mean(eom_results['Old_2022']['errors'][
+                eom_results['Old_2022']['dates'].year >= 2024]**2))
+            tag = '  ← better 2024–25' if rmse24 < old24 else ''
+        print(f'  {k:<16}  {rmse24:>14.3f}  {rmse_all:>14.3f}{tag}')
 
     print(f'\n  All figures and cic_forecast_output.xlsx saved to: {os.path.abspath(".")}')
     print(sep + '\n')
