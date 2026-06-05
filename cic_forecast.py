@@ -1032,7 +1032,7 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
             print(f'  (Fan forecast skipped for {mname}: {e})')
 
     if fan_fc:
-        # Collect all forecast points for the fan
+        # Shaded range between min/max forecast across models
         all_keys = set()
         for eom_fc in fan_fc.values():
             all_keys.update(eom_fc.keys())
@@ -1040,23 +1040,21 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
             mo = yr_mo[1]
             vals = [fan_fc[m][yr_mo] for m in fan_models if yr_mo in fan_fc.get(m, {})]
             if len(vals) >= 2:
-                ax.fill_between([mo - 0.05, mo + 0.05],
+                ax.fill_between([mo - 0.3, mo + 0.3],
                                 [min(vals), min(vals)], [max(vals), max(vals)],
-                                color='gold', alpha=0.35, zorder=8)
+                                color='#cccccc', alpha=0.5, zorder=7)
 
         fan_label_map = {'Old_2022': 'Old_2022 fc', 'ExtDummy': 'ExtDummy fc', 'D1': 'D1 fc'}
-        fan_markers   = {'Old_2022': 's', 'ExtDummy': '^', 'D1': 'D'}
         for mname in ('Old_2022', 'ExtDummy', 'D1'):
             eom_fc = fan_fc.get(mname, {})
             if not eom_fc:
                 continue
             xs = [k[1] for k in sorted(eom_fc)]
             ys = [eom_fc[k] for k in sorted(eom_fc)]
-            ax.scatter(xs, ys, s=160, zorder=10,
-                       color=COLORS.get(mname, 'gold'),
-                       edgecolors='black', linewidths=1.2,
-                       marker=fan_markers[mname],
-                       label=fan_label_map[mname])
+            ax.plot(xs, ys, marker='o', ms=7, lw=0, zorder=10,
+                    color=COLORS.get(mname, 'grey'),
+                    markeredgecolor='black', markeredgewidth=0.8,
+                    label=fan_label_map[mname])
 
     month_names = ['Jan','Feb','Mar','Apr','May','Jun',
                    'Jul','Aug','Sep','Oct','Nov','Dec']
@@ -1064,7 +1062,7 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     ax.set_xticklabels(month_names, fontsize=11)
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year\n'
-                 '(★ shaded = forecast range across Old_2022, ExtDummy, D1)',
+                 '(dots = next-month forecast; shaded band = range across Old_2022 / ExtDummy / D1)',
                  fontsize=13, fontweight='bold')
     ax.legend(fontsize=8.5, ncol=1, loc='upper left',
               bbox_to_anchor=(1.01, 1), borderaxespad=0,
@@ -1182,6 +1180,188 @@ def plot_fig11_eom_level(eom_results, save_dir='.'):
 
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig11_eom_level.png')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8d — CIC OUTPUT EXCEL (clean user-facing workbook)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_cic_output_excel(df, fitted_models_dict, hol, save_dir='.'):
+    """
+    Export a clean, user-facing CIC_output.xlsx with two sheets:
+
+    Tab 1 — Daily
+        Date | CIC Level (bn.) | Daily Change
+        Full historical series. Forecast rows (after last actual date) in yellow.
+
+    Tab 2 — Monthly EOM
+        Date | CIC Level (actual) | Monthly Change (actual)
+        | Old_2022 EOM Forecast | Old_2022 Monthly Change Forecast
+        | ExtDummy EOM Forecast | ExtDummy Monthly Change Forecast
+        | D1 EOM Forecast       | D1 Monthly Change Forecast
+        Historical actuals + next 2 months of forecast. Forecast rows in yellow.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    YELLOW = PatternFill(start_color='FFFFC0', end_color='FFFFC0', fill_type='solid')
+    HEADER = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+    HDR_FONT = Font(color='FFFFFF', bold=True)
+
+    path = os.path.join(save_dir, 'CIC_output.xlsx')
+
+    # ── Tab 1: Daily ──
+    df_lev = df[['Currency', 'Change']].copy()
+    df_lev.columns = ['CIC Level (bn.)', 'Daily Change (bn.)']
+    df_lev.index.name = 'Date'
+    df_lev = df_lev.dropna(subset=['CIC Level (bn.)'])
+    last_actual = df_lev.index.max()
+
+    # ── Build 2-month daily forecast for the 3 models ──
+    fc_start = (last_actual + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    fc_end   = (last_actual + pd.offsets.MonthEnd(2)).strftime('%Y-%m-%d')
+    model_order = ['Old_2022', 'ExtDummy', 'D1']
+
+    future_fc = {}  # mname -> pd.Series(change, index=future_dates)
+    for mname in model_order:
+        mdl = fitted_models_dict.get(mname)
+        if mdl is None:
+            continue
+        try:
+            key = 'Old_2022' if mname == 'D1' else mname
+            X_fut = generate_future_exog(key, fc_start, fc_end, hol)
+            if len(X_fut):
+                fc_change = mdl.forecast(X_fut.values)
+                future_fc[mname] = pd.Series(fc_change, index=X_fut.index)
+        except Exception as e:
+            print(f'  (CIC output forecast skipped for {mname}: {e})')
+
+    # Append forecast rows to daily tab
+    if future_fc:
+        ref_fc = next(iter(future_fc.values()))
+        fc_rows = pd.DataFrame({
+            'CIC Level (bn.)': np.nan,
+            'Daily Change (bn.)': np.nan,
+        }, index=ref_fc.index)
+        # Reconstruct CIC level from last actual
+        for mname, fc_s in future_fc.items():
+            lvl = df_lev['CIC Level (bn.)'].iloc[-1]
+            levels = []
+            for chg in fc_s.values:
+                lvl += chg
+                levels.append(lvl)
+        # Use the average across models for the daily tab level column
+        all_levels = []
+        for mname, fc_s in future_fc.items():
+            lvl = df_lev['CIC Level (bn.)'].iloc[-1]
+            lvls = []
+            for chg in fc_s.values:
+                lvl += chg
+                lvls.append(lvl)
+            all_levels.append(lvls)
+        avg_levels = np.mean(all_levels, axis=0)
+        avg_changes = np.mean([list(fc_s.values) for fc_s in future_fc.values()], axis=0)
+        fc_rows['CIC Level (bn.)']    = avg_levels
+        fc_rows['Daily Change (bn.)'] = avg_changes
+        daily_full = pd.concat([df_lev, fc_rows])
+    else:
+        daily_full = df_lev.copy()
+
+    # ── Tab 2: Monthly EOM ──
+    eom_actual = df_lev['CIC Level (bn.)'].resample('ME').last().dropna()
+    eom_change = eom_actual.diff()
+    eom_df = pd.DataFrame({
+        'CIC Level — Actual (bn.)': eom_actual,
+        'Monthly Change — Actual (bn.)': eom_change,
+    })
+    eom_df.index.name = 'Date'
+
+    # Add model EOM forecasts (historical rolling + next 2 months)
+    for mname in model_order:
+        eom_df[f'{BASE_LABELS.get(mname,mname)} — EOM Forecast (bn.)'] = np.nan
+        eom_df[f'{BASE_LABELS.get(mname,mname)} — Monthly Chg Forecast (bn.)'] = np.nan
+
+    # Next 2 months EOM forecasts
+    if future_fc:
+        for mname, fc_s in future_fc.items():
+            lbl = BASE_LABELS.get(mname, mname)
+            # Reconstruct cumulative level
+            lvl = df_lev['CIC Level (bn.)'].iloc[-1]
+            eom_forecasts = {}
+            for dt, chg in zip(fc_s.index, fc_s.values):
+                lvl += chg
+                eom_forecasts[(dt.year, dt.month)] = lvl
+            for (yr, mo), val in eom_forecasts.items():
+                idx_ts = pd.Timestamp(yr, mo, 1) + pd.offsets.MonthEnd(0)
+                if idx_ts not in eom_df.index:
+                    eom_df.loc[idx_ts, 'CIC Level — Actual (bn.)'] = np.nan
+                    eom_df.loc[idx_ts, 'Monthly Change — Actual (bn.)'] = np.nan
+                eom_df.loc[idx_ts, f'{lbl} — EOM Forecast (bn.)'] = val
+                # Monthly change forecast = forecast EOM - previous actual EOM
+                prev_eom = eom_actual.iloc[-1] if idx_ts not in eom_actual.index else eom_actual.get(idx_ts, np.nan)
+                prev_idx = eom_df.index[eom_df.index < idx_ts]
+                if len(prev_idx):
+                    prev_lev = eom_df.loc[prev_idx[-1], f'{lbl} — EOM Forecast (bn.)']
+                    if np.isnan(prev_lev):
+                        prev_lev = eom_df.loc[prev_idx[-1], 'CIC Level — Actual (bn.)']
+                    if not np.isnan(prev_lev):
+                        eom_df.loc[idx_ts, f'{lbl} — Monthly Chg Forecast (bn.)'] = val - prev_lev
+        eom_df = eom_df.sort_index()
+
+    # Write to Excel
+    daily_full.index.name = 'Date'
+    eom_df.index.name = 'Date'
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        daily_full.reset_index().to_excel(writer, sheet_name='Daily', index=False)
+        eom_df.reset_index().to_excel(writer, sheet_name='Monthly EOM', index=False)
+
+    # Apply styling with openpyxl
+    wb = load_workbook(path)
+
+    def style_sheet(ws, forecast_start_row, n_cols):
+        thin = Side(style='thin', color='CCCCCC')
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        # Header row
+        for col in range(1, n_cols + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.fill   = HEADER
+            cell.font   = HDR_FONT
+            cell.alignment = Alignment(horizontal='center', wrap_text=True)
+        # Data rows
+        for row in ws.iter_rows(min_row=2):
+            is_fc = row[0].row >= forecast_start_row
+            for cell in row:
+                if is_fc:
+                    cell.fill = YELLOW
+                cell.border = border
+                if cell.column == 1:
+                    cell.number_format = 'YYYY-MM-DD'
+                elif cell.value is not None and isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.00'
+        # Auto-width
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 30)
+
+    # Daily sheet: forecast rows start after last actual
+    ws_d = wb['Daily']
+    daily_full.index.name = 'Date'
+    daily_reset = daily_full.reset_index()
+    date_col = daily_reset.columns[0]  # robust to index name
+    fc_start_row_daily = 2 + int((daily_reset[date_col] <= last_actual).sum())
+    style_sheet(ws_d, fc_start_row_daily, daily_reset.shape[1])
+
+    # Monthly EOM sheet: forecast rows = months after last actual EOM
+    ws_m = wb['Monthly EOM']
+    eom_df.index.name = 'Date'
+    eom_reset = eom_df.reset_index()
+    date_col_eom = eom_reset.columns[0]
+    fc_start_row_eom = 2 + int((eom_reset[date_col_eom] <= last_actual).sum())
+    style_sheet(ws_m, fc_start_row_eom, eom_reset.shape[1])
+
+    wb.save(path)
+    print(f'  Saved → ./CIC_output.xlsx')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1655,6 +1835,10 @@ def main():
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
     export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res, eom_results)
+
+    # Clean user-facing workbook
+    print('  Exporting CIC_output.xlsx (daily + monthly EOM, 3 models)...')
+    export_cic_output_excel(df, m_fitted, hol)
 
     # ── Final summary ──
     print('\n' + sep)
