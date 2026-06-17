@@ -175,16 +175,18 @@ REGS = {
 BASE_LABELS = {
     'Old_2022': 'Original',
     'D1':       'Adaptive',
+    'Model3':   'Smooth-Trend',
 }
 
 COLORS = {
     'Old_2022': '#d62728',
     'D1':       '#9467bd',
+    'Model3':   '#2ca02c',
 }
 
 
 def model_label(mname, train_label):
-    return f'{BASE_LABELS[mname]} ({train_label})'
+    return f'{BASE_LABELS.get(mname, mname)} ({train_label})'
 
 
 def get_X(df, model_name):
@@ -453,6 +455,76 @@ class StateSpaceTrendModel:
         return self.uc_res.smoother_results.smoothed_state[0]
 
 
+class Model3TrendModel:
+    """
+    Model3: smooth-trend adaptive forecaster — two-step state-space.
+
+    Step 1: OLS on a TRAILING WINDOW of the last TRAILING_MONTHS calendar months
+            (default 60 = 5 years) using the same 55-dummy matrix as Old_2022.
+            This lets seasonal betas adapt to recent patterns.
+    Step 2: UnobservedComponents with level='smooth trend' + autoregressive=1
+            on the OLS residuals from the full history (using trailing-window betas).
+            Smooth trend: level variance fixed to 0, slope drifts (better for
+            slow-moving level forecasts; targets EOM level KPI).
+    """
+    TRAILING_MONTHS = 60  # tunable: ~5 years of recent data for OLS step
+
+    def __init__(self):
+        self.ols = None
+        self.uc_res = None
+        self.fitted = None
+        self.resid = None
+        self.aic = self.bic = np.nan
+
+    def fit(self, y_change, X, dates=None):
+        """
+        y_change : full-history array of daily ΔCIC
+        X        : full-history dummy matrix (same 55 cols as Old_2022)
+        dates    : optional pd.DatetimeIndex aligned with y_change/X;
+                   used to select trailing window. If None, uses last
+                   TRAILING_MONTHS*22 rows as proxy.
+        """
+        y_change = np.asarray(y_change, float)
+        X = np.asarray(X, float)
+        n = len(y_change)
+
+        # --- Step 1: trailing-window OLS ---
+        if dates is not None:
+            cutoff = dates[-1] - pd.DateOffset(months=self.TRAILING_MONTHS)
+            mask = dates >= cutoff
+        else:
+            # fallback: approximate 22 trading days/month
+            tw = min(self.TRAILING_MONTHS * 22, n)
+            mask = np.zeros(n, bool)
+            mask[-tw:] = True
+
+        X_tw = X[mask]
+        y_tw = y_change[mask]
+        self.ols = LinearRegression(fit_intercept=True).fit(X_tw, y_tw)
+
+        # --- Compute OLS residuals on FULL history using trailing-window betas ---
+        ols_fit_full = self.ols.predict(X)
+        ols_resid_full = y_change - ols_fit_full
+
+        # --- Step 2: UC smooth trend on full residuals ---
+        mod = UnobservedComponents(
+            endog=ols_resid_full,
+            level='smooth trend',
+            autoregressive=1
+        )
+        self.uc_res = mod.fit(disp=False, method='bfgs', maxiter=300)
+        self.fitted = ols_fit_full + np.asarray(self.uc_res.fittedvalues)
+        self.resid = y_change - self.fitted
+        self.aic = self.uc_res.aic
+        self.bic = self.uc_res.bic
+        return self
+
+    def forecast(self, X_future):
+        ols_fc = self.ols.predict(np.asarray(X_future, float))
+        uc_fc = self.uc_res.get_forecast(steps=len(X_future))
+        return ols_fc + np.asarray(uc_fc.predicted_mean)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — METRICS AND DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,9 +639,14 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
     the same X_future is reused for all models.
     """
     arimax_models = ['Old_2022']
-    ss_models     = ['D1']
+    ss_models     = ['D1', 'Model3']
     all_keys      = arimax_models + ss_models
     store         = {k: {'dates': [], 'actual': [], 'forecast': []} for k in all_keys}
+    # Component decomposition: comp1=calendar, comp2=drift
+    comp_store    = {k: {'dates': [], 'actual': [], 'total_fc': [],
+                          'comp1': [], 'comp2': []} for k in all_keys}
+    comp_store    = {k: {'dates': [], 'comp1': [], 'comp2': [], 'total_fc': [], 'actual': []}
+                     for k in all_keys}
 
     origins = pd.date_range(f'{start_year - 1}-12-31', f'{end_year - 1}-12-31', freq='ME')
 
@@ -616,6 +693,17 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
                 store[mname]['dates'].append(nm_end)
                 store[mname]['actual'].append(actual_eom)
                 store[mname]['forecast'].append(fc_eom)
+                # comp1 = dummies contribution (no intercept); comp2 = intercept + ARIMA tail
+                Xf_arr  = X_fut_df.values
+                n_fc    = len(Xf_arr)
+                c1_sum  = float((Xf_arr @ mdl.ols.coef_).sum())
+                arima_fc_sum = float(np.asarray(mdl.arima.forecast(steps=n_fc)).sum())
+                c2_sum  = float(mdl.ols.intercept_) * n_fc + arima_fc_sum
+                comp_store[mname]['dates'].append(nm_end)
+                comp_store[mname]['comp1'].append(last_level + c1_sum)
+                comp_store[mname]['comp2'].append(last_level + c2_sum)
+                comp_store[mname]['total_fc'].append(fc_eom)
+                comp_store[mname]['actual'].append(actual_eom)
             except Exception as exc:
                 print(f'    ⚠ {mname} EOM {origin.date()}: {exc}')
 
@@ -628,8 +716,42 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
             store['D1']['dates'].append(nm_end)
             store['D1']['actual'].append(actual_eom)
             store['D1']['forecast'].append(fc_eom)
+            # comp1 = calendar dummies; comp2 = intercept + UC adaptive drift
+            Xf_arr   = X_fut_df.values
+            n_fc     = len(Xf_arr)
+            c1_sum   = float((Xf_arr @ mdl.ols.coef_).sum())
+            uc_fc_s  = float(np.asarray(mdl.uc_res.get_forecast(steps=n_fc).predicted_mean).sum())
+            c2_sum   = float(mdl.ols.intercept_) * n_fc + uc_fc_s
+            comp_store['D1']['dates'].append(nm_end)
+            comp_store['D1']['comp1'].append(last_level + c1_sum)
+            comp_store['D1']['comp2'].append(last_level + c2_sum)
+            comp_store['D1']['total_fc'].append(fc_eom)
+            comp_store['D1']['actual'].append(actual_eom)
         except Exception as exc:
             print(f'    ⚠ D1 EOM {origin.date()}: {exc}')
+
+        # Model3 — uses Old_2022 regressors with trailing-window OLS
+        X_tr_m3, _ = get_X(df_train, 'Old_2022')
+        try:
+            mdl    = Model3TrendModel().fit(y_chg, X_tr_m3, dates=df_train.index)
+            fc     = mdl.forecast(X_fut_df.values)
+            fc_eom = last_level + float(fc.sum())
+            store['Model3']['dates'].append(nm_end)
+            store['Model3']['actual'].append(actual_eom)
+            store['Model3']['forecast'].append(fc_eom)
+            # comp1 = calendar dummies (trailing-window betas); comp2 = intercept + UC drift
+            Xf_arr   = X_fut_df.values
+            n_fc     = len(Xf_arr)
+            c1_sum   = float((Xf_arr @ mdl.ols.coef_).sum())
+            uc_fc_s  = float(np.asarray(mdl.uc_res.get_forecast(steps=n_fc).predicted_mean).sum())
+            c2_sum   = float(mdl.ols.intercept_) * n_fc + uc_fc_s
+            comp_store['Model3']['dates'].append(nm_end)
+            comp_store['Model3']['comp1'].append(last_level + c1_sum)
+            comp_store['Model3']['comp2'].append(last_level + c2_sum)
+            comp_store['Model3']['total_fc'].append(fc_eom)
+            comp_store['Model3']['actual'].append(actual_eom)
+        except Exception as exc:
+            print(f'    ⚠ Model3 EOM {origin.date()}: {exc}')
 
     # Finalise store
     for k in all_keys:
@@ -639,6 +761,16 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
         r['forecast'] = np.array(r['forecast'], dtype=float)
         r['errors']   = r['actual'] - r['forecast']
         r['RMSE']     = np.sqrt(np.mean(r['errors'] ** 2)) if len(r['errors']) > 0 else np.nan
+
+    # Finalise comp_store
+    for k in all_keys:
+        c = comp_store[k]
+        c['dates']    = pd.DatetimeIndex(c['dates'])
+        c['comp1']    = np.array(c['comp1'],    dtype=float)
+        c['comp2']    = np.array(c['comp2'],    dtype=float)
+        c['total_fc'] = np.array(c['total_fc'], dtype=float)
+        c['actual']   = np.array(c['actual'],   dtype=float)
+    store['_comp'] = comp_store
 
     # Print summary
     print(f'\n  EOM Level Backtest  ({start_year}–{end_year}):')
@@ -1001,12 +1133,12 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     fc_end    = (last_date + pd.Timedelta(days=45)).strftime('%Y-%m-%d')
 
     fan_models = {k: v for k, v in fitted_models_dict.items()
-                  if k in ('Old_2022', 'ExtDummy', 'D1')}
+                  if k in ('Old_2022', 'ExtDummy', 'D1', 'Model3')}
     fan_fc = {}  # mname -> {(yr, mo): eom_level}
 
     for mname, mdl in fan_models.items():
         try:
-            X_fut = generate_future_exog('Old_2022' if mname == 'D1' else mname,
+            X_fut = generate_future_exog('Old_2022' if mname in ('D1', 'Model3') else mname,
                                          fc_start, fc_end, hol)
             if len(X_fut) == 0:
                 continue
@@ -1033,8 +1165,9 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
                                 [min(vals), min(vals)], [max(vals), max(vals)],
                                 color='#cccccc', alpha=0.5, zorder=7)
 
-        fan_label_map = {'Old_2022': 'Old_2022 fc', 'ExtDummy': 'ExtDummy fc', 'D1': 'D1 fc'}
-        for mname in ('Old_2022', 'ExtDummy', 'D1'):
+        fan_label_map = {'Old_2022': 'Old_2022 fc', 'ExtDummy': 'ExtDummy fc',
+                         'D1': 'D1 fc', 'Model3': 'Model3 fc'}
+        for mname in ('Old_2022', 'ExtDummy', 'D1', 'Model3'):
             eom_fc = fan_fc.get(mname, {})
             if not eom_fc:
                 continue
@@ -1051,7 +1184,7 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     ax.set_xticklabels(month_names, fontsize=11)
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year\n'
-                 '(dots = next-month forecast; shaded band = range across Old_2022 / ExtDummy / D1)',
+                 '(dots = next-month forecast; shaded band = range across Old_2022 / D1 / Model3)',
                  fontsize=13, fontweight='bold')
     ax.legend(fontsize=8.5, ncol=1, loc='upper left',
               bbox_to_anchor=(1.01, 1), borderaxespad=0,
@@ -1093,25 +1226,38 @@ def plot_fig10_trend_slope(df_train, ss_d1_res, save_dir='.'):
     _save(fig, save_dir, 'fig10_trend_slope.png')
 
 
-def plot_fig11_eom_level(eom_results, save_dir='.'):
+def plot_fig11_eom_level(eom_results, eom_results_precovid=None, save_dir='.'):
     """
-    fig11 — Actual vs forecast end-of-month CIC level, all 5 models.
+    fig11 — Actual vs forecast end-of-month CIC level, all 3 models.
 
     Left  : EOM level traces — actual (black) vs all model forecasts.
-    Right : per-year RMSE bars — shows which model wins in which regime.
+    Right : per-year RMSE bars including pre-COVID years when precovid results provided.
     """
-    model_order = ['Old_2022', 'ExtDummy', 'Regime', 'Fourier_Regime', 'D1']
-    model_labels = {
-        'Old_2022':       'Old_2022 (frozen drift)',
-        'ExtDummy':       'ExtDummy',
-        'Regime':         'Regime+ExtDummy',
-        'Fourier_Regime': 'Fourier+Regime',
-        'D1':             'Model D1 (adaptive drift)',
-    }
+    model_order = ['Old_2022', 'D1', 'Model3']
+
+    # Merge pre-COVID + post-COVID results for the bar chart
+    combined = {}
+    for k in model_order:
+        pre  = eom_results_precovid.get(k, {}) if eom_results_precovid else {}
+        post = eom_results.get(k, {})
+        pre_dates  = pre.get('dates', pd.DatetimeIndex([]))
+        post_dates = post.get('dates', pd.DatetimeIndex([]))
+        if len(pre_dates) == 0 and len(post_dates) == 0:
+            combined[k] = {'dates': pd.DatetimeIndex([]), 'actual': np.array([]),
+                           'forecast': np.array([]), 'errors': np.array([]), 'RMSE': np.nan}
+        else:
+            all_dates = pre_dates.append(post_dates)
+            all_actual = np.concatenate([pre.get('actual', np.array([])),
+                                          post.get('actual', np.array([]))])
+            all_fc     = np.concatenate([pre.get('forecast', np.array([])),
+                                          post.get('forecast', np.array([]))])
+            all_err    = all_actual - all_fc
+            combined[k] = {'dates': all_dates, 'actual': all_actual, 'forecast': all_fc,
+                           'errors': all_err, 'RMSE': float(np.sqrt(np.mean(all_err**2)))}
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 7))
 
-    # Left — actual vs forecast level traces
+    # Left — actual vs forecast level traces (post-COVID period only for clarity)
     ax = axes[0]
     ref = eom_results.get('Old_2022', {})
     if len(ref.get('dates', [])):
@@ -1122,10 +1268,10 @@ def plot_fig11_eom_level(eom_results, save_dir='.'):
         if len(r.get('dates', [])) == 0:
             continue
         rmse = r.get('RMSE', np.nan)
-        lw   = 2.0 if k == 'D1' else 1.2
+        lw   = 2.0 if k in ('D1', 'Model3') else 1.2
         ax.plot(r['dates'], r['forecast'], color=COLORS.get(k, 'grey'),
                 lw=lw, alpha=0.85,
-                label=f'{model_labels[k]}  RMSE={rmse:.1f}')
+                label=f'{BASE_LABELS.get(k, k)}  RMSE={rmse:.1f}')
     ax.axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2020-12-31'),
                alpha=0.10, color='red', label='COVID 2020')
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
@@ -1137,23 +1283,24 @@ def plot_fig11_eom_level(eom_results, save_dir='.'):
     ax.grid(alpha=0.25)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
 
-    # Right — per-year RMSE bars
+    # Right — per-year RMSE bars (combined pre-COVID + post-COVID)
     ax = axes[1]
-    ref_dates = eom_results.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
-    years = sorted(set(ref_dates.year)) if len(ref_dates) else []
+    all_dates_ref = combined.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
+    years = sorted(set(all_dates_ref.year)) if len(all_dates_ref) else []
     x = np.arange(len(years))
     n = len(model_order)
     w = 0.8 / n
     for j, k in enumerate(model_order):
-        r    = eom_results.get(k, {})
+        r    = combined.get(k, {})
         vals = []
         for yr in years:
             mask = r.get('dates', pd.DatetimeIndex([])).year == yr
-            vals.append(np.sqrt(np.mean(r['errors'][mask] ** 2)) if mask.sum() > 0 else np.nan)
+            vals.append(float(np.sqrt(np.mean(r['errors'][mask] ** 2)))
+                        if mask.sum() > 0 else np.nan)
         offset = (j - n / 2 + 0.5) * w
         bars   = ax.bar(x + offset, vals, w * 0.9,
                         color=COLORS.get(k, 'grey'), alpha=0.85,
-                        label=model_labels[k])
+                        label=BASE_LABELS.get(k, k))
         for bar, val in zip(bars, vals):
             if not np.isnan(val):
                 ax.text(bar.get_x() + bar.get_width() / 2,
@@ -1169,6 +1316,123 @@ def plot_fig11_eom_level(eom_results, save_dir='.'):
 
     fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig11_eom_level.png')
+
+
+def plot_fig_model_comparison(m_data, rolling_metrics, eom_results,
+                               eom_results_precovid=None, save_dir='.'):
+    """
+    fig_model_comparison — 3-panel summary comparing all evaluation types.
+
+    Panel 1 (top)    : OOS daily ΔCIC — actual vs all 3 model forecasts (2020-2026).
+    Panel 2 (middle) : Rolling yearly backtest RMSE (expanding-window, ARIMAX = Old_2022).
+    Panel 3 (bottom) : Rolling monthly EOM RMSE by year — all 3 models, incl. pre-COVID.
+    """
+    all_models   = ['Old_2022', 'D1', 'Model3']
+    forecasts    = m_data['forecasts']
+    df_eval      = m_data['df_eval']
+    train_label  = m_data['train_label']
+    actual       = df_eval['Change'].values
+    dates        = df_eval.index
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 16))
+
+    # ── Panel 1: OOS daily ΔCIC ──
+    ax = axes[0]
+    ax.plot(dates, actual, color='#333333', lw=1.2, label='Actual', zorder=5)
+    for mname in all_models:
+        pred = forecasts.get(mname)
+        if pred is None:
+            continue
+        rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+        ax.plot(dates, pred, color=COLORS.get(mname, 'grey'), lw=1.5, alpha=0.75,
+                label=f'{BASE_LABELS.get(mname, mname)}  RMSE={rmse:.2f}')
+    ax.axhline(0, color='black', lw=0.5, ls='--')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.set_ylabel('Daily ΔCIC (THB bn)', fontsize=10)
+    ax.set_title(f'Out-of-Sample Daily Forecast  (Train: {train_label}  |  OOS: {dates[0]:%b %Y}→{dates[-1]:%b %Y})',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(axis='y', alpha=0.2)
+
+    # ── Panel 2: Rolling backtest RMSE (Old_2022 only — ARIMAX core models) ──
+    ax = axes[1]
+    all_wl = []
+    for mname, wdict in rolling_metrics.items():
+        all_wl = list(wdict.keys())
+        break
+    x = np.arange(len(all_wl))
+    n_rm = len(rolling_metrics)
+    w    = 0.8 / max(n_rm, 1)
+    for j, (mname, wdict) in enumerate(rolling_metrics.items()):
+        vals = [wdict.get(wl, {}).get('RMSE', np.nan) for wl in all_wl]
+        offset = (j - n_rm / 2 + 0.5) * w
+        ax.bar(x + offset, vals, w * 0.9, color=COLORS.get(mname, 'grey'), alpha=0.85,
+               label=BASE_LABELS.get(mname, mname))
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_wl, rotation=40, fontsize=8, ha='right')
+    ax.set_ylabel('Daily ΔCIC RMSE (THB bn)', fontsize=10)
+    ax.set_title('Rolling Yearly Backtest — Expanding-Window RMSE',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.2)
+
+    # ── Panel 3: Rolling monthly EOM RMSE by year (all 3 models + pre-COVID) ──
+    ax = axes[2]
+    # Merge pre-COVID and post-COVID results
+    combined_eom = {}
+    for k in all_models:
+        pre  = eom_results_precovid.get(k, {}) if eom_results_precovid else {}
+        post = eom_results.get(k, {})
+        pre_d  = pre.get('dates', pd.DatetimeIndex([]))
+        post_d = post.get('dates', pd.DatetimeIndex([]))
+        if len(pre_d) == 0 and len(post_d) == 0:
+            combined_eom[k] = {'dates': pd.DatetimeIndex([]), 'errors': np.array([])}
+        else:
+            combined_eom[k] = {
+                'dates':  pre_d.append(post_d),
+                'errors': np.concatenate([pre.get('errors', np.array([])),
+                                          post.get('errors', np.array([]))]),
+            }
+
+    ref_dates_eom = combined_eom.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
+    years_eom = sorted(set(ref_dates_eom.year)) if len(ref_dates_eom) else []
+    x2  = np.arange(len(years_eom))
+    n3  = len(all_models)
+    w3  = 0.8 / n3
+    for j, k in enumerate(all_models):
+        r    = combined_eom[k]
+        vals = []
+        for yr in years_eom:
+            mask = r.get('dates', pd.DatetimeIndex([])).year == yr
+            vals.append(float(np.sqrt(np.mean(r['errors'][mask] ** 2)))
+                        if mask.sum() > 0 else np.nan)
+        offset = (j - n3 / 2 + 0.5) * w3
+        bars = ax.bar(x2 + offset, vals, w3 * 0.9, color=COLORS.get(k, 'grey'), alpha=0.85,
+                      label=BASE_LABELS.get(k, k))
+        for bar, val in zip(bars, vals):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.3,
+                        f'{val:.0f}', ha='center', va='bottom', fontsize=6.5)
+    # shade pre-COVID years
+    pre_yrs = set()
+    if eom_results_precovid:
+        pre_ref = eom_results_precovid.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
+        pre_yrs = set(pre_ref.year) if len(pre_ref) else set()
+    for i, yr in enumerate(years_eom):
+        if yr in pre_yrs:
+            ax.axvspan(i - 0.5, i + 0.5, alpha=0.07, color='green', zorder=0)
+    ax.set_xticks(x2)
+    ax.set_xticklabels([str(y) for y in years_eom], rotation=45, fontsize=9)
+    ax.set_ylabel('EOM Level RMSE (THB bn)', fontsize=10)
+    ax.set_title('Rolling Monthly EOM Level RMSE by Year\n(green shading = pre-COVID normal period)',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.2)
+
+    fig.tight_layout(pad=2.5)
+    _save(fig, save_dir, 'fig_model_comparison.png')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1208,7 +1472,7 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
     forecasts  = main['forecasts']          # mname -> np.array of daily change forecasts
 
     # Display order: Original then Adaptive
-    MODEL_ORDER = ['Old_2022', 'D1']
+    MODEL_ORDER = ['Old_2022', 'D1', 'Model3']
 
     last_actual     = df['Currency'].dropna().index.max()
     last_actual_eom = df['Currency'].dropna().resample('ME').last().dropna().index.max()
@@ -1237,7 +1501,7 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
         if mdl is None:
             continue
         try:
-            key = 'Old_2022' if mname == 'D1' else mname
+            key = 'Old_2022' if mname in ('D1', 'Model3') else mname
             X_fut = generate_future_exog(key, fc_start, fc_end, hol)
             if not len(X_fut):
                 continue
@@ -1312,8 +1576,8 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
 
     # ── Build Summary DataFrame ──
     # Columns = next 2 forecast months, Rows = 2 models + avg seasonal
-    summary_models   = ['Old_2022', 'D1']
-    summary_row_lbls = [BASE_LABELS[m] for m in summary_models] + ['Avg Post-COVID Seasonal']
+    summary_models   = ['Old_2022', 'D1', 'Model3']
+    summary_row_lbls = [BASE_LABELS.get(m, m) for m in summary_models] + ['Avg Post-COVID Seasonal']
 
     # Identify the 2 forecast month-end dates (strictly after last actual EOM)
     last_actual_eom = eom_actual.dropna().index.max()
@@ -1582,7 +1846,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
         # ── Level EOM Metrics (Model D backtest) ──
         if eom_results:
             eom_rows = []
-            model_order = ['Old_2022', 'D1']
+            model_order = ['Old_2022', 'D1', 'Model3']
             for k in model_order:
                 r = eom_results.get(k, {})
                 if not len(r.get('dates', [])):
@@ -1603,7 +1867,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
 
             # Also write detail rows (date, actual, forecast, error per model)
             detail_frames = []
-            for k in ['Old_2022', 'D1']:
+            for k in ['Old_2022', 'D1', 'Model3']:
                 r = eom_results.get(k, {})
                 if not len(r.get('dates', [])):
                     continue
@@ -1618,6 +1882,52 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
             if detail_frames:
                 pd.concat(detail_frames).sort_values(['Date', 'Model']).to_excel(
                     writer, sheet_name='Level_EOM_Detail', index=False)
+
+            # ── Component Decomposition sheet ──
+            comp_store = eom_results.get('_comp', {})
+            if comp_store:
+                comp_detail_frames = []
+                for k in ['Old_2022', 'D1', 'Model3']:
+                    c = comp_store.get(k, {})
+                    if not len(c.get('dates', [])):
+                        continue
+                    tmp = pd.DataFrame({
+                        'Date':            c['dates'],
+                        'Model':           k,
+                        'Comp1_Calendar':  c['comp1'],
+                        'Comp2_Drift':     c['comp2'],
+                        'Total_Forecast':  c['total_fc'],
+                        'Actual':          c['actual'],
+                        'Error':           c['actual'] - c['total_fc'],
+                    })
+                    comp_detail_frames.append(tmp)
+                if comp_detail_frames:
+                    comp_df = pd.concat(comp_detail_frames).sort_values(['Date', 'Model'])
+                    comp_df.to_excel(writer, sheet_name='Component_Decomp', index=False)
+
+                    # Summary: RMSE(actual - comp_only_level) per model per year
+                    # Comp1_RMSE = error using calendar dummies alone (no drift)
+                    # Comp2_RMSE = error using drift alone (no calendar)
+                    sum_rows = []
+                    for k in ['Old_2022', 'D1', 'Model3']:
+                        c = comp_store.get(k, {})
+                        if not len(c.get('dates', [])):
+                            continue
+                        act_c  = c['actual']
+                        c1_arr = c['comp1']
+                        c2_arr = c['comp2']
+                        years = sorted(set(c['dates'].year))
+                        row = {'Model': k}
+                        for yr in years:
+                            mask = c['dates'].year == yr
+                            if mask.sum() > 0:
+                                e1 = act_c[mask] - c1_arr[mask]
+                                e2 = act_c[mask] - c2_arr[mask]
+                                row[f'Comp1_CalOnly_RMSE_{yr}']   = round(float(np.sqrt(np.mean(e1**2))), 3)
+                                row[f'Comp2_DriftOnly_RMSE_{yr}'] = round(float(np.sqrt(np.mean(e2**2))), 3)
+                        sum_rows.append(row)
+                    if sum_rows:
+                        pd.DataFrame(sum_rows).to_excel(writer, sheet_name='Component_Summary', index=False)
 
     print(f'  Saved → ./cic_forecast_output.xlsx')
 
@@ -1688,6 +1998,15 @@ def main():
         'eval_end':    '2026-05-31',   # will be clipped to last available date
     }
 
+    # Config 3 — Pre-COVID: train 1997-2017, OOS = 2018-2019 (pure out-of-sample)
+    CFG_PRECOVID = {
+        'key':         'cfg_precovid',
+        'train_label': '1997-2017',
+        'train_end':   '2017-12-31',
+        'eval_start':  '2018-01-01',
+        'eval_end':    '2019-12-31',
+    }
+
     # Expanding-window rolling backtest: 1-year OOS each window, covers full history
     BACKTEST_WINDOWS = [
         ('2018-12-31', '2019-01-01', '2019-12-31'),
@@ -1733,7 +2052,7 @@ def main():
     print('  ' + '-' * 72)
 
     configs_results = {}
-    for cfg in [CFG_BENCHMARK, CFG_MAIN]:
+    for cfg in [CFG_BENCHMARK, CFG_MAIN, CFG_PRECOVID]:
         key      = cfg['key']
         lbl      = cfg['train_label']
         df_train = df.loc[:cfg['train_end']]
@@ -1760,12 +2079,24 @@ def main():
         except Exception as exc:
             print(f'  ⚠ D1 ({lbl}): {exc}')
 
+        # Model3 — smooth trend with trailing-window OLS
+        X_tr_m3, _ = get_X(df_train, 'Old_2022')
+        try:
+            m3_mdl = Model3TrendModel().fit(
+                df_train['Change'].values, X_tr_m3,
+                dates=df_train.index
+            )
+            fitted_models['Model3'] = m3_mdl
+            print(f'  [{"Model3 ("+lbl+")":<28}]  AIC={m3_mdl.aic:9.1f}  BIC={m3_mdl.bic:9.1f}')
+        except Exception as exc:
+            print(f'  ⚠ Model3 ({lbl}): {exc}')
+
         # Forecasts and metrics for eval period
         forecasts     = {}
         bench_metrics = {}
         actual_arr    = df_eval['Change'].values
         for mname, mdl in fitted_models.items():
-            if mname == 'D1':
+            if mname in ('D1', 'Model3'):
                 X_ev, _ = get_X(df_eval, 'Old_2022')
             else:
                 X_ev, _ = get_X(df_eval, mname)
@@ -1783,7 +2114,7 @@ def main():
             'bench_metrics': bench_metrics,
         }
 
-    ALL_MODELS_INCL_D1 = ALL_MODELS + ['D1']  # ['Old_2022', 'D1']
+    ALL_MODELS_WITH_SS = ALL_MODELS + ['D1', 'Model3']  # ['Old_2022', 'D1', 'Model3']
 
     # ── 4. Benchmark metrics ──
     print('\n[4] Benchmark metrics:')
@@ -1862,6 +2193,9 @@ def main():
     print('     (One UC fit + 4 ARIMAX fits per month-origin — ~5 min total)')
     eom_results = month_end_eom_backtest(df, hol, start_year=2020, end_year=2025)
 
+    print('\n[8d] EOM level backtest — pre-COVID period (2018-2019)...')
+    eom_results_precovid = month_end_eom_backtest(df, hol, start_year=2018, end_year=2019)
+
     # ── 9. Figures ──
     print('\n[9] Generating figures...')
 
@@ -1895,8 +2229,8 @@ def main():
 
     plot_fig8_garch(m_data['df_train'].index, old_res, garch_res)
 
-    print('  Generating fig9 (seasonal CIC + 2-model fan chart)...')
-    fan_models_dict = {k: m_fitted[k] for k in ('Old_2022', 'D1') if k in m_fitted}
+    print('  Generating fig9 (seasonal CIC + 3-model fan chart)...')
+    fan_models_dict = {k: m_fitted[k] for k in ('Old_2022', 'D1', 'Model3') if k in m_fitted}
     plot_fig9_seasonal_cic(df, fan_models_dict, hol)
 
     # fig10 — D1 adaptive drift
@@ -1906,9 +2240,14 @@ def main():
     else:
         print('  ⚠ Skipping fig10 — D1 failed to fit.')
 
-    # fig11 — EOM level comparison, all 5 models
-    print('  Generating fig11 (EOM level comparison, all 5 models)...')
-    plot_fig11_eom_level(eom_results)
+    # fig11 — EOM level comparison, all 3 models (with pre-COVID merged)
+    print('  Generating fig11 (EOM level comparison, all 3 models)...')
+    plot_fig11_eom_level(eom_results, eom_results_precovid=eom_results_precovid)
+
+    # fig12 — Model comparison 3-panel
+    print('  Generating fig12 (model comparison 3-panel)...')
+    plot_fig_model_comparison(m_data, rolling_metrics, eom_results,
+                               eom_results_precovid=eom_results_precovid)
 
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
@@ -1933,7 +2272,7 @@ def main():
         print(f'\n  ── Config ({lbl}), eval {ev} ──')
         print(f'  {"Model":<36} {"RMSE":>6}  {"vs Old_2022":>11}  {"vs BOT paper":>13}')
         print('  ' + '-' * 70)
-        for mname in ALL_MODELS_INCL_D1:
+        for mname in ALL_MODELS_WITH_SS:
             if mname not in bm:
                 continue
             r      = bm[mname]['RMSE']
@@ -1950,7 +2289,7 @@ def main():
 
     # EOM level RMSE summary
     print(f'\n  ── EOM Level RMSE (primary KPI — 1-month-ahead, 2020–2025) ──')
-    eom_models = ['Old_2022', 'D1']
+    eom_models = ['Old_2022', 'D1', 'Model3']
     print(f'  {"Model":<20}  {"2024–25 RMSE":>14}  {"Overall RMSE":>14}')
     print('  ' + '-' * 52)
     old24 = None
@@ -1967,6 +2306,54 @@ def main():
         if k != 'Old_2022' and old24 is not None and not np.isnan(rmse24):
             tag = '  ← better' if rmse24 < old24 else ''
         print(f'  {k:<20}  {rmse24:>14.3f}  {rmse_all:>14.3f}{tag}')
+
+    # Pre-COVID EOM RMSE
+    print(f'\n  ── Pre-COVID EOM Level RMSE (2018–2019) ──')
+    print(f'  {"Model":<20}  {"Overall RMSE":>14}')
+    print('  ' + '-' * 38)
+    for k in eom_models:
+        r = eom_results_precovid.get(k, {})
+        if not len(r.get('dates', [])):
+            continue
+        print(f'  {k:<20}  {r["RMSE"]:>14.3f}')
+
+    # ── NEW MODEL SUMMARY ──
+    print(f'\n  ── NEW MODEL SUMMARY ──')
+    _pre_rmse = {}
+    for k in ['Old_2022', 'D1', 'Model3']:
+        r = eom_results_precovid.get(k, {})
+        _pre_rmse[k] = r.get('RMSE', float('nan'))
+    print(f'  Pre-COVID OOS EOM RMSE (2018-2019):  ' +
+          '  '.join(f'{k}={_pre_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+
+    _2025_rmse = {}
+    for k in ['Old_2022', 'D1', 'Model3']:
+        r = eom_results.get(k, {})
+        if len(r.get('dates', [])):
+            mask25 = r['dates'].year == 2025
+            _2025_rmse[k] = np.sqrt(np.mean(r['errors'][mask25]**2)) if mask25.sum() > 0 else float('nan')
+        else:
+            _2025_rmse[k] = float('nan')
+    print(f'  2025 EOM RMSE:                        ' +
+          '  '.join(f'{k}={_2025_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+
+    _comp_st = eom_results.get('_comp', {})
+    _c1_rmse = {}
+    _c2_rmse = {}
+    for k in ['Old_2022', 'D1', 'Model3']:
+        c = _comp_st.get(k, {})
+        if len(c.get('comp1', [])) and len(c.get('actual', [])):
+            act  = np.array(c['actual'])
+            err1 = act - np.array(c['comp1'])
+            err2 = act - np.array(c['comp2'])
+            _c1_rmse[k] = float(np.sqrt(np.mean(err1**2)))
+            _c2_rmse[k] = float(np.sqrt(np.mean(err2**2)))
+        else:
+            _c1_rmse[k] = _c2_rmse[k] = float('nan')
+    print(f'  Comp1 (Calendar-only) RMSE:           ' +
+          '  '.join(f'{k}={_c1_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+    print(f'  Comp2 (Drift-only)    RMSE:           ' +
+          '  '.join(f'{k}={_c2_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
 
     print(f'\n  All figures and cic_forecast_output.xlsx saved to: {os.path.abspath(".")}')
     print(sep + '\n')
