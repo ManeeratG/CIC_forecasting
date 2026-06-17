@@ -26,6 +26,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.cm as cm
+import matplotlib.patches as mpatches
 from scipy import stats
 
 from sklearn.linear_model import LinearRegression
@@ -1192,35 +1193,330 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     _save(fig, save_dir, 'fig9_seasonal_cic.png')
 
 
-def plot_fig10_trend_slope(df_train, ss_d1_res, save_dir='.'):
+def plot_fig10_trend_slope(df_train, ss_d1_res, ss_model3_res=None, save_dir='.'):
     """
-    fig10 — Smoothed adaptive drift ν_t from Model D1.
+    fig10 — Kalman-smoothed states from adaptive models.
 
-    Key diagnostic: ν_t must show the 2020 COVID cash-hoarding hump and the
-    post-2021 digital-payment-erosion decline. Old_2022's frozen constant
-    (shown as dashed baseline) cannot adapt to either regime change.
+    Panel 1: D1 local-level state ν_t on ΔCIC residuals (after calendar removal).
+             Positive ν_t = residuals trending up; negative = trending down.
+             Old_2022 treats this as fixed at 0 (horizontal dashed line).
+    Panel 2 (if Model3 provided): smooth-trend slope component (THB bn/day per day).
+             This is the rate-of-change of the trend — positive = accelerating CIC growth.
+
+    How to read:
+    - COVID 2020 hump: ν_t rises sharply (cash hoarding) then falls back
+    - Post-2021 decline: ν_t turns negative (digital payments eroding cash demand)
+    - Old_2022's zero line shows what a static model misses
     """
-    idx   = df_train.index[:len(ss_d1_res.fitted)]
-    drift = ss_d1_res.smoothed_drift()[:len(idx)]
+    if ss_d1_res is None:
+        print('  ⚠ plot_fig10: D1 model is None, skipping.')
+        return
 
-    fig, ax = plt.subplots(figsize=(15, 5))
-    ax.plot(idx, drift, color=COLORS['D1'], lw=1.2,
-            label='D1 smoothed drift ν_t  (adaptive — Kalman-filtered)')
-    ax.axhline(0, color='black', lw=0.7, ls='--', label='Zero baseline (≈ Old_2022 frozen constant)')
-    ax.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
-               alpha=0.12, color='red', label='COVID 2020 (cash hoarding ↑)')
-    ax.axvline(pd.Timestamp('2021-01-01'), color='orange', lw=1.4, ls='--', alpha=0.9,
-               label='Post-2021 digital-payment erosion (drift ↓)')
-    ax.set_ylabel('Adaptive drift ν_t on ΔCIC residuals (THB bn/day)', fontsize=11)
-    ax.set_title('Model D1 — Smoothed Adaptive Drift ν_t  (1997 – training end)\n'
-                 'Old_2022 uses a single frozen constant; D1 updates it via the Kalman filter',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=9, loc='upper left')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.grid(alpha=0.25)
-    fig.tight_layout()
+    n_train = len(df_train)
+
+    # D1: local level state = smoothed_state[0]  shape (n_states, T)
+    try:
+        d1_raw = np.asarray(ss_d1_res.uc_res.smoother_results.smoothed_state[0])
+    except Exception:
+        d1_raw = ss_d1_res.smoothed_drift()
+    d1_state = d1_raw[:n_train]
+    d1_idx   = df_train.index[:len(d1_state)]
+
+    has_m3 = (ss_model3_res is not None)
+    m3_slope = m3_idx = None
+    if has_m3:
+        try:
+            # Model3 smooth trend: state[1] = trend slope
+            m3_raw   = np.asarray(ss_model3_res.uc_res.smoother_results.smoothed_state[1])
+            m3_slope = m3_raw[:n_train]
+            m3_idx   = df_train.index[:len(m3_slope)]
+        except Exception:
+            has_m3 = False
+
+    n_panels = 2 if has_m3 else 1
+    fig, axes = plt.subplots(n_panels, 1, figsize=(15, 5 * n_panels), squeeze=False)
+
+    def _shade(ax):
+        t0 = pd.Timestamp('2020-03-01')
+        t1 = pd.Timestamp('2020-12-31')
+        tl = df_train.index[-1]
+        if t0 <= tl:
+            ax.axvspan(t0, min(t1, tl), alpha=0.12, color='red', label='COVID 2020')
+        if tl >= pd.Timestamp('2021-01-01'):
+            ax.axvline(pd.Timestamp('2021-01-01'), color='orange', lw=1.2, ls='--',
+                       alpha=0.8, label='Post-2021 digital shift')
+        ax.axhline(0, color='black', lw=0.8, ls='--', alpha=0.5,
+                   label='Zero (Old_2022 frozen constant)')
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.grid(alpha=0.25)
+
+    # ── Panel 1: D1 local level ──
+    ax1 = axes[0, 0]
+    ax1.plot(d1_idx, d1_state, color=COLORS['D1'], lw=1.5,
+             label='D1 local level ν_t  (Kalman-smoothed adaptive drift)')
+    _shade(ax1)
+    margin = max(0.001, (d1_state.max() - d1_state.min()) * 0.08)
+    ax1.set_ylim(d1_state.min() - margin, d1_state.max() + margin)
+    ax1.set_ylabel('Local level on ΔCIC residuals (THB bn/day)', fontsize=11)
+    ax1.set_title(
+        'Model D1 — Kalman-Smoothed Local Level ν_t on Calendar-Adjusted ΔCIC\n'
+        'Positive = upward trend in residuals; negative = downward. '
+        f'Range: [{d1_state.min():.3f}, {d1_state.max():.3f}] THB bn/day',
+        fontsize=11, fontweight='bold')
+    ax1.legend(fontsize=9, loc='upper left')
+
+    # ── Panel 2: Model3 smooth trend slope ──
+    if has_m3:
+        ax2 = axes[1, 0]
+        ax2.plot(m3_idx, m3_slope, color=COLORS['Model3'], lw=1.5,
+                 label='Model3 smooth trend slope  (THB bn/day per day)')
+        _shade(ax2)
+        margin2 = max(1e-6, (m3_slope.max() - m3_slope.min()) * 0.08)
+        ax2.set_ylim(m3_slope.min() - margin2, m3_slope.max() + margin2)
+        ax2.set_ylabel('Smooth trend slope (THB bn/day²)', fontsize=11)
+        ax2.set_title(
+            'Model3 — Kalman-Smoothed Trend Slope (rate of change of drift)\n'
+            'Positive = CIC growth accelerating; negative = decelerating. '
+            f'Range: [{m3_slope.min():.4f}, {m3_slope.max():.4f}]',
+            fontsize=11, fontweight='bold')
+        ax2.legend(fontsize=9, loc='upper left')
+
+    fig.tight_layout(pad=2)
     _save(fig, save_dir, 'fig10_trend_slope.png')
+
+
+def plot_fig_component_decomp(eom_results, eom_results_precovid=None, save_dir='.'):
+    """
+    fig_component_decomp — Calendar vs Drift decomposition of EOM level forecasts.
+
+    How to read:
+    - Top panel: actual EOM CIC level vs each component in isolation
+        * 'Calendar-only' = what EOM level you'd get if only seasonal effects moved CIC
+        * 'Drift-only'    = what EOM level you'd get if only the trend/drift moved CIC
+        * Total forecast  = calendar + drift combined (the real model output)
+    - Bottom panel: RMSE bar chart
+        * Comp1-RMSE = error if you used only the calendar component (ignoring drift)
+        * Comp2-RMSE = error if you used only the drift component (ignoring calendar)
+        * Total-RMSE = actual model error (both components combined)
+        Comp1 & Comp2 errors are always >= Total-RMSE — the combination wins.
+    """
+    model_order = ['Old_2022', 'D1', 'Model3']
+    comp_store  = eom_results.get('_comp', {})
+    pre_comp    = (eom_results_precovid or {}).get('_comp', {})
+
+    if not comp_store:
+        print('  ⚠ plot_fig_component_decomp: no comp_store data found.')
+        return
+
+    # Merge pre-COVID + post-COVID comp data per model
+    def _merge_comp(k):
+        pre  = pre_comp.get(k, {})
+        post = comp_store.get(k, {})
+        out  = {}
+        for field in ('dates', 'comp1', 'comp2', 'total_fc', 'actual'):
+            pv = pre.get(field, [] if field != 'dates' else pd.DatetimeIndex([]))
+            sv = post.get(field, [] if field != 'dates' else pd.DatetimeIndex([]))
+            if field == 'dates':
+                out[field] = (pd.DatetimeIndex(list(pv) + list(sv))
+                              if len(pv) or len(sv) else pd.DatetimeIndex([]))
+            else:
+                out[field] = np.concatenate([np.array(pv, float), np.array(sv, float)])
+        return out
+
+    merged = {k: _merge_comp(k) for k in model_order}
+
+    # Determine year range for bar chart
+    all_years = sorted({yr for k in model_order
+                        for yr in merged[k].get('dates', pd.DatetimeIndex([])).year})
+    pre_years = set()
+    if eom_results_precovid:
+        for k in model_order:
+            pre_years |= set(pre_comp.get(k, {}).get('dates', pd.DatetimeIndex([])).year)
+
+    fig = plt.figure(figsize=(20, 13))
+    gs  = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.3,
+                           height_ratios=[1.4, 1])
+
+    # ── Top row: one time-series panel per model ──
+    for col, k in enumerate(model_order):
+        ax = fig.add_subplot(gs[0, col])
+        c  = merged[k]
+        if not len(c.get('dates', [])):
+            ax.set_title(f'{BASE_LABELS.get(k, k)}\n(no data)', fontsize=10)
+            continue
+        dates   = c['dates']
+        actual  = c['actual']
+        total   = c['total_fc']
+        comp1   = c['comp1']
+        comp2   = c['comp2']
+
+        ax.plot(dates, actual, color='#333333', lw=2, label='Actual', zorder=6)
+        ax.plot(dates, total,  color=COLORS.get(k, 'grey'), lw=1.5,
+                label='Total forecast', zorder=5)
+        ax.plot(dates, comp1, color='#1f77b4', lw=1.2, ls='--',
+                label='Calendar-only', alpha=0.85)
+        ax.plot(dates, comp2, color='#ff7f0e', lw=1.2, ls=':',
+                label='Drift-only', alpha=0.85)
+
+        # Shade pre-COVID
+        if pre_years:
+            for yr in pre_years:
+                msk = dates.year == yr
+                if msk.sum() >= 2:
+                    ax.axvspan(dates[msk][0], dates[msk][-1], alpha=0.07,
+                               color='green', zorder=0)
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
+        ax.set_title(f'{BASE_LABELS.get(k, k)} — EOM Level Components', fontsize=10, fontweight='bold')
+        ax.set_ylabel('CIC Level (THB bn)', fontsize=9)
+        ax.legend(fontsize=7.5, loc='upper left', ncol=2)
+        ax.grid(alpha=0.2)
+
+    # ── Bottom row: RMSE breakdown bar chart per model ──
+    ax_bar = fig.add_subplot(gs[1, :])
+    x      = np.arange(len(all_years))
+    n_m    = len(model_order)
+    n_comp = 3   # comp1-only, comp2-only, total
+    group_w = 0.8
+    bar_w   = group_w / (n_m * n_comp + n_m - 1)  # slight gap between models
+
+    hatches = ['///', '\\\\\\', '']
+    clabels = ['Cal-only RMSE', 'Drift-only RMSE', 'Total RMSE']
+    legend_handles = []
+
+    for j, k in enumerate(model_order):
+        c    = merged[k]
+        if not len(c.get('dates', [])):
+            continue
+        dates   = c['dates']
+        actual  = c['actual']
+        comp1   = c['comp1']
+        comp2   = c['comp2']
+        total   = c['total_fc']
+        clr     = COLORS.get(k, 'grey')
+
+        for ci, (comp_vals, hatch, clbl) in enumerate(
+                zip([comp1, comp2, total], hatches, clabels)):
+            vals = []
+            for yr in all_years:
+                msk = dates.year == yr
+                if msk.sum() > 0:
+                    err = actual[msk] - comp_vals[msk]
+                    vals.append(float(np.sqrt(np.mean(err ** 2))))
+                else:
+                    vals.append(np.nan)
+
+            offset = (j * (n_comp + 1) + ci - (n_m * (n_comp + 1) - 1) / 2) * bar_w
+            bars   = ax_bar.bar(x + offset, vals, bar_w * 0.92,
+                                color=clr, hatch=hatch, alpha=0.75 if ci < 2 else 0.95,
+                                edgecolor='white' if ci == 2 else clr)
+            if j == 0:
+                legend_handles.append(
+                    mpatches.Patch(facecolor='grey', hatch=hatch, alpha=0.8, label=clbl))
+
+        # model color swatch in legend
+        legend_handles.append(
+            mpatches.Patch(facecolor=clr, label=BASE_LABELS.get(k, k)))
+
+    # Shade pre-COVID year ticks
+    for i, yr in enumerate(all_years):
+        if yr in pre_years:
+            ax_bar.axvspan(i - 0.5, i + 0.5, alpha=0.07, color='green', zorder=0)
+
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels([str(y) for y in all_years], rotation=45, fontsize=9)
+    ax_bar.set_ylabel('EOM Level RMSE (THB bn)', fontsize=11)
+    ax_bar.set_title(
+        'Component RMSE Breakdown by Year\n'
+        'Cal-only (///): if only calendar used  |  Drift-only (\\\\\\): if only drift used  '
+        '|  Total: full model  |  green shading = pre-COVID',
+        fontsize=10, fontweight='bold')
+    ax_bar.legend(handles=legend_handles, fontsize=8, ncol=4, loc='upper right')
+    ax_bar.grid(axis='y', alpha=0.25)
+
+    _save(fig, save_dir, 'fig_component_decomp.png')
+
+
+def plot_fig_oos_error(m_data, save_dir='.'):
+    """
+    fig_oos_error — Daily OOS forecast errors for all 3 models.
+
+    How to read:
+    - Top panel: signed daily error = actual ΔCIC minus model forecast.
+        Positive = model under-forecast (CIC rose more than expected).
+        Negative = model over-forecast (CIC fell more than expected).
+        Large spikes = holiday/shock events the model missed.
+    - Bottom panel: 3-month rolling RMSE — shows whether errors are shrinking
+        or growing over time. A rising line = model degrading in that period.
+    """
+    model_order = ['Old_2022', 'D1', 'Model3']
+    df_eval     = m_data['df_eval']
+    forecasts   = m_data['forecasts']
+    actual      = df_eval['Change'].values
+    dates       = df_eval.index
+
+    errors = {}
+    for k in model_order:
+        pred = forecasts.get(k)
+        if pred is not None:
+            errors[k] = actual - pred
+
+    if not errors:
+        print('  ⚠ plot_fig_oos_error: no forecast data.')
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+
+    # ── Panel 1: signed daily error ──
+    ax1 = axes[0]
+    ax1.axhline(0, color='black', lw=0.7, ls='--', alpha=0.5)
+    for k in model_order:
+        if k not in errors:
+            continue
+        rmse = float(np.sqrt(np.mean(errors[k] ** 2)))
+        ax1.plot(dates, errors[k], color=COLORS.get(k, 'grey'), lw=0.8, alpha=0.7,
+                 label=f'{BASE_LABELS.get(k, k)}  RMSE={rmse:.2f}')
+    ax1.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
+                alpha=0.10, color='red', label='COVID 2020')
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax1.xaxis.set_major_locator(mdates.YearLocator())
+    ax1.set_ylabel('Forecast Error  (actual − forecast)  THB bn/day', fontsize=11)
+    ax1.set_title(
+        f'OOS Daily Forecast Error  (Train: {m_data["train_label"]}  |  '
+        f'OOS: {dates[0]:%b %Y} → {dates[-1]:%b %Y})\n'
+        'Positive = under-forecast; Negative = over-forecast',
+        fontsize=12, fontweight='bold')
+    ax1.legend(fontsize=9, loc='upper right')
+    ax1.grid(axis='y', alpha=0.2)
+
+    # ── Panel 2: 3-month rolling RMSE ──
+    ax2 = axes[1]
+    window = 66  # ≈ 3 months of business days
+    for k in model_order:
+        if k not in errors:
+            continue
+        err_s  = pd.Series(errors[k], index=dates)
+        sq_err = err_s ** 2
+        roll_rmse = np.sqrt(sq_err.rolling(window, min_periods=20).mean())
+        ax2.plot(dates, roll_rmse, color=COLORS.get(k, 'grey'), lw=1.5,
+                 label=BASE_LABELS.get(k, k))
+    ax2.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
+                alpha=0.10, color='red', label='COVID 2020')
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax2.xaxis.set_major_locator(mdates.YearLocator())
+    ax2.set_ylabel('3-Month Rolling RMSE (THB bn/day)', fontsize=11)
+    ax2.set_title(
+        '3-Month Rolling OOS RMSE\n'
+        'Rising line = errors growing in that window; flat = stable accuracy',
+        fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=9, loc='upper right')
+    ax2.grid(axis='y', alpha=0.2)
+
+    fig.tight_layout(pad=2)
+    _save(fig, save_dir, 'fig_oos_error.png')
 
 
 def plot_fig11_eom_level(eom_results, eom_results_precovid=None, save_dir='.'):
@@ -2230,10 +2526,11 @@ def main():
     fan_models_dict = {k: m_fitted[k] for k in ('Old_2022', 'D1', 'Model3') if k in m_fitted}
     plot_fig9_seasonal_cic(df, fan_models_dict, hol)
 
-    # fig10 — D1 adaptive drift
+    # fig10 — D1 adaptive drift + Model3 smooth trend slope
+    ss_model3 = m_fitted.get('Model3')
     if ss_d1 is not None:
-        print('  Generating fig10 (Model D1 adaptive drift)...')
-        plot_fig10_trend_slope(m_df_train, ss_d1)
+        print('  Generating fig10 (adaptive drift + smooth trend slope)...')
+        plot_fig10_trend_slope(m_df_train, ss_d1, ss_model3_res=ss_model3)
     else:
         print('  ⚠ Skipping fig10 — D1 failed to fit.')
 
@@ -2245,6 +2542,14 @@ def main():
     print('  Generating fig12 (model comparison 3-panel)...')
     plot_fig_model_comparison(m_data, rolling_metrics, eom_results,
                                eom_results_precovid=eom_results_precovid)
+
+    # fig_component_decomp — Calendar vs Drift decomposition
+    print('  Generating fig_component_decomp (calendar vs drift breakdown)...')
+    plot_fig_component_decomp(eom_results, eom_results_precovid=eom_results_precovid)
+
+    # fig_oos_error — OOS daily errors + rolling RMSE
+    print('  Generating fig_oos_error (OOS forecast errors)...')
+    plot_fig_oos_error(m_data)
 
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
