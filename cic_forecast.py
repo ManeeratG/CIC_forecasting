@@ -642,9 +642,6 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
     ss_models     = ['D1', 'Model3']
     all_keys      = arimax_models + ss_models
     store         = {k: {'dates': [], 'actual': [], 'forecast': []} for k in all_keys}
-    # Component decomposition: comp1=calendar, comp2=drift
-    comp_store    = {k: {'dates': [], 'actual': [], 'total_fc': [],
-                          'comp1': [], 'comp2': []} for k in all_keys}
     comp_store    = {k: {'dates': [], 'comp1': [], 'comp2': [], 'total_fc': [], 'actual': []}
                      for k in all_keys}
 
