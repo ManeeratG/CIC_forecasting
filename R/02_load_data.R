@@ -5,7 +5,27 @@
 # Currency = CIC level in THB billion.
 # Change   = daily first-difference of Currency (ΔCIC), the model target.
 
-load_cic_data <- function(filepath = here::here("input.xlsx")) {
+find_input_xlsx <- function() {
+  # here::here() root may sit above the folder that contains input.xlsx
+  # (e.g. when the .Rproj is in a parent directory). Search multiple candidates.
+  candidates <- c(
+    here::here("input.xlsx"),                      # repo root (GitHub layout)
+    here::here("model_2022", "input.xlsx"),        # local: root/model_2022/input.xlsx
+    file.path(getwd(), "input.xlsx"),              # plain working directory
+    file.path(getwd(), "..", "input.xlsx")         # one level up from cwd
+  )
+  found <- Filter(file.exists, candidates)
+  if (length(found) == 0L) {
+    stop(paste0(
+      "Cannot find input.xlsx. Searched:\n",
+      paste(" -", candidates, collapse = "\n"), "\n",
+      "Pass the full path explicitly: load_cic_data(filepath = '...')"
+    ))
+  }
+  normalizePath(found[[1L]])
+}
+
+load_cic_data <- function(filepath = find_input_xlsx()) {
   raw <- readxl::read_excel(filepath, sheet = "RAW", skip = 1)
 
   raw$Date     <- as.Date(raw$Date)
