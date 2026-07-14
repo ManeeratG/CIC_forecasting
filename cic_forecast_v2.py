@@ -440,6 +440,15 @@ def daily_guardrail(df, daily_store, baseline_key='Old_2022', lo=None, hi=None):
 # SECTION 5 — OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def reconciled_daily_path(daily_store, base_key, base_eom, target_eom, target):
+    """Production daily path for an EOM-only forecast (M1 or a combination):
+    take the daily-model's within-month calendar shape and shift it by the
+    constant per-day amount needed to hit the reconciled EOM level."""
+    base = daily_store[base_key][target]
+    shift = (target_eom - base_eom) / len(base)
+    return base + shift
+
+
 def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='cic_v2_results.xlsx'):
     with pd.ExcelWriter(path, engine='openpyxl') as xw:
         sel_tbl.round(3).to_excel(xw, sheet_name='EOM_Selection')
@@ -567,7 +576,8 @@ def main():
 
     export_results(results, sel_tbl, hold_tbl, guard_tbl)
     plot_eom(results, [k for k in results if k in
-                       ('Old_2022', 'D1', 'M1_SARIMA', 'M1_UC', 'D2_smooth', 'CMB_invMSE')])
+                       ('Old_2022', 'D1', 'M1_SARIMA', 'D2_smooth',
+                        'CMB_invMSE', 'CMB_Old_2022+M1_SARIMA')])
 
 
 if __name__ == '__main__':
