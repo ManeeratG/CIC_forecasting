@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-CIC Forecasting Model — Bank of Thailand
-Old Model (2022 ARMA(1,1)) vs New Improved Models
-Daily Currency in Circulation level-change forecasting for monthly monitor
+CIC Forecasting — Bank of Thailand — daily pipeline
+Daily Currency in Circulation level-change forecasting for the monthly monitor.
+
+See CIC_model_document.md for the problem statement, methodology and results.
+
+Models defined here (names follow <Frequency>_<Method>):
+  Daily_Baseline          the 2022 EViews model — OLS on 55 calendar dummies
+                          + ARIMA(1,0,1) on the residuals
+  Daily_AdaptiveDrift     + local-level state-space drift replacing the constant
+  Daily_AdaptiveSeasonal  + trailing-window OLS betas and a smooth-trend state
+
+Candidate evaluation on the primary end-of-month-level KPI lives in
+cic_forecast_v2.py, which imports the models and data loaders from this file.
 
 Estimation strategy:
   Two-step ARIMAX: OLS regression for the mean equation + ARIMA(1,0,1) on
@@ -170,19 +180,21 @@ REGIME   = ['D_PostCovid']
 FOURIER  = [f'{fn}_ann_{k}' for fn in ['sin', 'cos'] for k in range(1, 4)]
 
 REGS = {
-    'Old_2022': DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD,
+    'Daily_Baseline': DOM_COLS + DOW_COLS + WOM_COLS + MON_COLS + HOL_OLD,
 }
 
+# Display labels == model keys, so figures, Excel headers and the documentation
+# all use one vocabulary (<Frequency>_<Method>).
 BASE_LABELS = {
-    'Old_2022': 'Original',
-    'D1':       'Adaptive',
-    'Model3':   'Smooth-Trend',
+    'Daily_Baseline':         'Daily_Baseline',
+    'Daily_AdaptiveDrift':    'Daily_AdaptiveDrift',
+    'Daily_AdaptiveSeasonal': 'Daily_AdaptiveSeasonal',
 }
 
 COLORS = {
-    'Old_2022': '#d62728',
-    'D1':       '#9467bd',
-    'Model3':   '#2ca02c',
+    'Daily_Baseline':         '#d62728',
+    'Daily_AdaptiveDrift':    '#9467bd',
+    'Daily_AdaptiveSeasonal': '#2ca02c',
 }
 
 
@@ -398,16 +410,16 @@ class TwoStepARIMAX:
 # SECTION 4b — STATE-SPACE TREND MODEL (Model D)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class StateSpaceTrendModel:
+class AdaptiveDriftModel:
     """
     Model D: adaptive-drift forecaster — two-step state-space.
 
-    Step 1: OLS on the same calendar dummy matrix as Old_2022 (concentrates out
+    Step 1: OLS on the same calendar dummy matrix as Daily_Baseline (concentrates out
             regression betas analytically, same as TwoStepARIMAX Step 1).
     Step 2: UnobservedComponents on the OLS residuals — no exog, so MLE only
             optimises 2–3 variance parameters (20–50× faster than joint UC).
 
-    D1  — local level on ΔCIC residuals:
+    Daily_AdaptiveDrift  — local level on ΔCIC residuals:
             resid_t = ν_t + u_t,  ν_t = ν_{t-1} + ζ_t  (AR(1) irregular)
           ν_t is the stochastic drift; adapts as the regime changes.
           EOM forecast = L_last + Σ (OLS_mean + UC_level_forecast).
@@ -419,10 +431,10 @@ class StateSpaceTrendModel:
     """
 
     VARIANTS = {
-        'D1': {'endog': 'change', 'level': 'local level'},
+        'Daily_AdaptiveDrift': {'endog': 'change', 'level': 'local level'},
     }
 
-    def __init__(self, variant='D1'):
+    def __init__(self, variant='Daily_AdaptiveDrift'):
         if variant not in self.VARIANTS:
             raise ValueError(f'Unknown variant {variant!r}. Choose from {list(self.VARIANTS)}')
         self.variant = variant
@@ -456,12 +468,12 @@ class StateSpaceTrendModel:
         return self.uc_res.smoother_results.smoothed_state[0]
 
 
-class Model3TrendModel:
+class AdaptiveSeasonalModel:
     """
-    Model3: smooth-trend adaptive forecaster — two-step state-space.
+    Daily_AdaptiveSeasonal: smooth-trend adaptive forecaster — two-step state-space.
 
     Step 1: OLS on a TRAILING WINDOW of the last TRAILING_MONTHS calendar months
-            (default 60 = 5 years) using the same 55-dummy matrix as Old_2022.
+            (default 60 = 5 years) using the same 55-dummy matrix as Daily_Baseline.
             This lets seasonal betas adapt to recent patterns.
     Step 2: UnobservedComponents with level='smooth trend' + autoregressive=1
             on the OLS residuals from the full history (using trailing-window betas).
@@ -480,7 +492,7 @@ class Model3TrendModel:
     def fit(self, y_change, X, dates=None):
         """
         y_change : full-history array of daily ΔCIC
-        X        : full-history dummy matrix (same 55 cols as Old_2022)
+        X        : full-history dummy matrix (same 55 cols as Daily_Baseline)
         dates    : optional pd.DatetimeIndex aligned with y_change/X;
                    used to select trailing window. If None, uses last
                    TRAILING_MONTHS*22 rows as proxy.
@@ -632,15 +644,15 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
 
     For each origin = last trading day of month M (level L_M known):
       1. Fit all 5 models on data up to origin (expanding window).
-      2. Forecast all business days of M+1 via generate_future_exog('Old_2022').
+      2. Forecast all business days of M+1 via generate_future_exog('Daily_Baseline').
       3. EOM level forecast = L_M + Σ ΔCIC_hat over M+1.
       4. Error = actual EOM(M+1) level − forecast.
 
     All five ARIMAX/StateSpace variants share the same calendar dummy matrix so
     the same X_future is reused for all models.
     """
-    arimax_models = ['Old_2022']
-    ss_models     = ['D1', 'Model3']
+    arimax_models = ['Daily_Baseline']
+    ss_models     = ['Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
     all_keys      = arimax_models + ss_models
     store         = {k: {'dates': [], 'actual': [], 'forecast': []} for k in all_keys}
     comp_store    = {k: {'dates': [], 'comp1': [], 'comp2': [], 'total_fc': [], 'actual': []}
@@ -673,7 +685,7 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
         fc_start = df_next.index[0].strftime('%Y-%m-%d')
         fc_end   = df_next.index[-1].strftime('%Y-%m-%d')
         try:
-            X_fut_df = generate_future_exog('Old_2022', fc_start, fc_end, hol)
+            X_fut_df = generate_future_exog('Daily_Baseline', fc_start, fc_end, hol)
         except Exception:
             continue
         if len(X_fut_df) == 0:
@@ -705,51 +717,51 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
             except Exception as exc:
                 print(f'    ⚠ {mname} EOM {origin.date()}: {exc}')
 
-        # D1 — uses Old_2022 regressors
-        X_tr_ss, _ = get_X(df_train, 'Old_2022')
+        # Daily_AdaptiveDrift — uses Daily_Baseline regressors
+        X_tr_ss, _ = get_X(df_train, 'Daily_Baseline')
         try:
-            mdl    = StateSpaceTrendModel('D1').fit(y_chg, X_tr_ss)
+            mdl    = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(y_chg, X_tr_ss)
             fc     = mdl.forecast(X_fut_df.values)
             fc_eom = last_level + float(fc.sum())
-            store['D1']['dates'].append(nm_end)
-            store['D1']['actual'].append(actual_eom)
-            store['D1']['forecast'].append(fc_eom)
+            store['Daily_AdaptiveDrift']['dates'].append(nm_end)
+            store['Daily_AdaptiveDrift']['actual'].append(actual_eom)
+            store['Daily_AdaptiveDrift']['forecast'].append(fc_eom)
             # comp1 = calendar dummies; comp2 = intercept + UC adaptive drift
             Xf_arr   = X_fut_df.values
             n_fc     = len(Xf_arr)
             c1_sum   = float((Xf_arr @ mdl.ols.coef_).sum())
             uc_fc_s  = float(np.asarray(mdl.uc_res.get_forecast(steps=n_fc).predicted_mean).sum())
             c2_sum   = float(mdl.ols.intercept_) * n_fc + uc_fc_s
-            comp_store['D1']['dates'].append(nm_end)
-            comp_store['D1']['comp1'].append(last_level + c1_sum)
-            comp_store['D1']['comp2'].append(last_level + c2_sum)
-            comp_store['D1']['total_fc'].append(fc_eom)
-            comp_store['D1']['actual'].append(actual_eom)
+            comp_store['Daily_AdaptiveDrift']['dates'].append(nm_end)
+            comp_store['Daily_AdaptiveDrift']['comp1'].append(last_level + c1_sum)
+            comp_store['Daily_AdaptiveDrift']['comp2'].append(last_level + c2_sum)
+            comp_store['Daily_AdaptiveDrift']['total_fc'].append(fc_eom)
+            comp_store['Daily_AdaptiveDrift']['actual'].append(actual_eom)
         except Exception as exc:
-            print(f'    ⚠ D1 EOM {origin.date()}: {exc}')
+            print(f'    ⚠ Daily_AdaptiveDrift EOM {origin.date()}: {exc}')
 
-        # Model3 — uses Old_2022 regressors with trailing-window OLS
-        X_tr_m3, _ = get_X(df_train, 'Old_2022')
+        # Daily_AdaptiveSeasonal — uses Daily_Baseline regressors with trailing-window OLS
+        X_tr_m3, _ = get_X(df_train, 'Daily_Baseline')
         try:
-            mdl    = Model3TrendModel().fit(y_chg, X_tr_m3, dates=df_train.index)
+            mdl    = AdaptiveSeasonalModel().fit(y_chg, X_tr_m3, dates=df_train.index)
             fc     = mdl.forecast(X_fut_df.values)
             fc_eom = last_level + float(fc.sum())
-            store['Model3']['dates'].append(nm_end)
-            store['Model3']['actual'].append(actual_eom)
-            store['Model3']['forecast'].append(fc_eom)
+            store['Daily_AdaptiveSeasonal']['dates'].append(nm_end)
+            store['Daily_AdaptiveSeasonal']['actual'].append(actual_eom)
+            store['Daily_AdaptiveSeasonal']['forecast'].append(fc_eom)
             # comp1 = calendar dummies (trailing-window betas); comp2 = intercept + UC drift
             Xf_arr   = X_fut_df.values
             n_fc     = len(Xf_arr)
             c1_sum   = float((Xf_arr @ mdl.ols.coef_).sum())
             uc_fc_s  = float(np.asarray(mdl.uc_res.get_forecast(steps=n_fc).predicted_mean).sum())
             c2_sum   = float(mdl.ols.intercept_) * n_fc + uc_fc_s
-            comp_store['Model3']['dates'].append(nm_end)
-            comp_store['Model3']['comp1'].append(last_level + c1_sum)
-            comp_store['Model3']['comp2'].append(last_level + c2_sum)
-            comp_store['Model3']['total_fc'].append(fc_eom)
-            comp_store['Model3']['actual'].append(actual_eom)
+            comp_store['Daily_AdaptiveSeasonal']['dates'].append(nm_end)
+            comp_store['Daily_AdaptiveSeasonal']['comp1'].append(last_level + c1_sum)
+            comp_store['Daily_AdaptiveSeasonal']['comp2'].append(last_level + c2_sum)
+            comp_store['Daily_AdaptiveSeasonal']['total_fc'].append(fc_eom)
+            comp_store['Daily_AdaptiveSeasonal']['actual'].append(actual_eom)
         except Exception as exc:
-            print(f'    ⚠ Model3 EOM {origin.date()}: {exc}')
+            print(f'    ⚠ Daily_AdaptiveSeasonal EOM {origin.date()}: {exc}')
 
     # Finalise store
     for k in all_keys:
@@ -820,7 +832,7 @@ def _save(fig, directory, filename):
     print(f'  Saved → ./{filename}')
 
 
-def plot_fig1_overview(df, save_dir='.'):
+def plot_data_overview(df, save_dir='.'):
     df_lev = df[df['Currency'].notna()]
     fig, axes = plt.subplots(2, 1, figsize=(15, 8))
     ax = axes[0]
@@ -845,68 +857,10 @@ def plot_fig1_overview(df, save_dir='.'):
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig1_cic_overview.png')
+    _save(fig, save_dir, 'fig1_data_overview.png')
 
 
-def plot_fig2_actual_vs_forecast(df_eval, forecast_dict, train_label, save_dir='.'):
-    fig, ax = plt.subplots(figsize=(15, 5))
-    actual = df_eval['Change'].values
-    dates  = df_eval.index
-    ax.plot(dates, actual, color='#333333', lw=1.5, label='Actual', zorder=5)
-    for mname, pred in forecast_dict.items():
-        rmse = np.sqrt(np.mean((actual - pred)**2))
-        lw   = 2.0 if mname == 'D1' else (1.8 if mname == 'ExtDummy' else 1.1)
-        ax.plot(dates, pred, color=COLORS.get(mname, 'grey'), lw=lw, alpha=0.8,
-                label=f'{BASE_LABELS.get(mname, mname)}  RMSE={rmse:.3f}')
-    ax.axhline(0, color='black', lw=0.5, ls='--')
-    for ms in pd.date_range(dates[0].replace(day=1), dates[-1], freq='YS'):
-        ax.axvline(pd.Timestamp(ms), color='grey', lw=0.6, ls=':')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.set_ylabel('Daily CIC Change (THB billion)', fontsize=11)
-    eval_desc = f'{dates[0].strftime("%b %Y")} → {dates[-1].strftime("%b %Y")}'
-    ax.set_title(f'Actual vs. Forecast — Daily ΔCIC  ({eval_desc})', fontsize=13, fontweight='bold')
-    ax.set_xlabel(f'Train: {train_label}  |  OOS: {eval_desc}', fontsize=9, color='dimgrey')
-    ax.legend(fontsize=9, loc='upper right')
-    ax.grid(axis='y', alpha=0.25)
-    fig.tight_layout()
-    _save(fig, save_dir, 'fig2_actual_vs_forecast.png')
-
-
-def plot_fig3_errors(df_eval, forecast_dict, train_label, save_dir='.'):
-    actual = df_eval['Change'].values
-    dates  = df_eval.index
-    n      = len(forecast_dict)
-    fig, axes = plt.subplots(n, 2, figsize=(16, 3.8 * n))
-    if n == 1:
-        axes = axes[np.newaxis, :]
-    for i, (mname, pred) in enumerate(forecast_dict.items()):
-        err  = actual - pred
-        rmse = np.sqrt(np.mean(err**2))
-        col  = COLORS.get(mname, 'grey')
-        ax   = axes[i, 0]
-        ax.bar(dates, err, color=col, alpha=0.65, width=1.5)
-        ax.axhline(0, color='black', lw=0.7)
-        ax.set_title(f'{BASE_LABELS.get(mname, mname)} — Error (RMSE={rmse:.3f} THB bn)', fontsize=10)
-        ax.set_ylabel('Error (THB bn)')
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
-        ax = axes[i, 1]
-        ax.hist(err, bins=30, color=col, alpha=0.75, density=True, edgecolor='white')
-        xr = np.linspace(err.min(), err.max(), 200)
-        ax.plot(xr, stats.norm.pdf(xr, err.mean(), err.std()), 'k-', lw=1.5, label='Normal')
-        ax.axvline(0, color='k', lw=0.8, ls='--')
-        ax.set_title('Error Distribution', fontsize=10)
-        ax.set_xlabel('Error (THB bn)')
-        ax.legend(fontsize=8)
-    eval_desc = f'{dates[0].strftime("%b %Y")} → {dates[-1].strftime("%b %Y")}'
-    fig.suptitle(f'Forecast Errors  |  Train: {train_label}  |  OOS: {eval_desc}',
-                 fontsize=9, color='dimgrey', y=1.01)
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig3_forecast_errors.png')
-
-
-def plot_fig4_residuals(residuals_dict, train_label, save_dir='.'):
+def plot_residual_diagnostics(residuals_dict, train_label, save_dir='.'):
     models = list(residuals_dict.keys())
     n      = len(models)
     fig, axes = plt.subplots(n, 2, figsize=(14, 4.2 * n))
@@ -933,137 +887,10 @@ def plot_fig4_residuals(residuals_dict, train_label, save_dir='.'):
         ax.set_xlabel('Theoretical quantiles')
         ax.set_ylabel('Sample quantiles')
     fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig4_residual_diagnostics.png')
+    _save(fig, save_dir, 'fig2_residual_diagnostics.png')
 
 
-def plot_fig5_rmse_comparison(all_bench, rolling_metrics, eval_period_label='', save_dir='.'):
-    """
-    all_bench = list of (model_name, rmse, color) for cfg_main only.
-    LHS: daily RMSE bars for the main OOS period.
-    RHS: 7-window rolling backtest for all 4 ARIMAX models.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
-
-    # LHS — RMSE bars, cfg_main OOS only
-    ax = axes[0]
-    labels = [BASE_LABELS.get(x[0], x[0]) for x in all_bench]
-    rmsev  = [x[1] for x in all_bench]
-    colors = [x[2] for x in all_bench]
-    bars   = ax.bar(range(len(labels)), rmsev, color=colors, alpha=0.85)
-    ax.axhline(4.96, color='black', ls='--', lw=1.8, label='BOT 2022 paper baseline: 4.96')
-    ax.axhline(7.31, color='grey',  ls=':',  lw=1.5, label='Pre-2022 model: 7.31')
-    for bar, val in zip(bars, rmsev):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=9)
-    ax.set_ylabel('Daily ΔCIC RMSE (THB billion)', fontsize=11)
-    ax.set_title(f'Daily Forecast RMSE — OOS Period\n{eval_period_label}',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(axis='y', alpha=0.3)
-    ax.set_ylim(0, max(8.5, max(rmsev) * 1.2))
-
-    # RHS — 7-window rolling backtest, all 4 ARIMAX models
-    ax = axes[1]
-    compare    = [m for m in ['Old_2022', 'ExtDummy', 'Regime', 'Fourier_Regime']
-                  if m in rolling_metrics]
-    win_labels = list(next(iter(rolling_metrics.values())).keys()) if rolling_metrics else []
-    x  = np.arange(len(win_labels))
-    n  = len(compare)
-    w  = 0.8 / n
-    for j, mname in enumerate(compare):
-        vals   = [rolling_metrics[mname].get(wl, {}).get('RMSE', np.nan) for wl in win_labels]
-        offset = (j - n / 2 + 0.5) * w
-        bars   = ax.bar(x + offset, vals, w * 0.9,
-                        color=COLORS.get(mname, 'grey'), alpha=0.85,
-                        label=BASE_LABELS[mname])
-        for bar, val in zip(bars, vals):
-            if not np.isnan(val):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                        f'{val:.2f}', ha='center', va='bottom', fontsize=7)
-    ax.set_xticks(x)
-    ax.set_xticklabels([wl[:7] + '\n→' + wl[10:] for wl in win_labels], fontsize=8)
-    ax.set_ylabel('Daily ΔCIC RMSE (THB billion)', fontsize=11)
-    ax.set_title('Rolling Backtest RMSE — All Years\n(Expanding window, 1-year OOS each)',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(axis='y', alpha=0.3)
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig5_rmse_comparison.png')
-
-
-def plot_fig6_horizon(h_rmse_dict, train_label, save_dir='.'):
-    fig, ax = plt.subplots(figsize=(10, 6))
-    markers = ['o', 's', '^', 'D']
-    for i, (mname, hdict) in enumerate(h_rmse_dict.items()):
-        hs   = sorted(hdict.keys())
-        vals = [hdict[h] for h in hs]
-        ax.plot(hs, vals, marker=markers[i % len(markers)],
-                color=COLORS.get(mname, 'grey'), lw=2.2, ms=10,
-                label=BASE_LABELS.get(mname, mname))
-        for h, r in zip(hs, vals):
-            if not np.isnan(r):
-                ax.annotate(f'{r:.2f}', (h, r), xytext=(5, 5),
-                            textcoords='offset points', fontsize=9.5)
-    ax.set_xticks([1, 5, 10, 22])
-    ax.set_xticklabels(['1-day\n(next day)', '5-day\n(1 week)',
-                         '10-day\n(2 weeks)', '22-day\n(1 month)'])
-    ax.set_ylabel('RMSE (THB billion)', fontsize=11)
-    ax.set_title('Forecast Accuracy vs Horizon\n(3 Monthly Origins)',
-                 fontsize=13, fontweight='bold')
-    ax.set_xlabel('Train: 1997–2019  |  OOS: Jan 2020 – May 2026', fontsize=9, color='dimgray')
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    _save(fig, save_dir, 'fig6_horizon_rmse.png')
-
-
-def plot_fig7_monthly_monitor(df_eval, forecast_dict, train_label, save_dir='.'):
-    actual        = df_eval['Change']
-    monthly_actual = actual.resample('ME').sum()
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    ax = axes[0]
-    ax.bar(monthly_actual.index, monthly_actual.values, width=20,
-           color='#333333', alpha=0.35, label='Actual')
-    for mname, pred in forecast_dict.items():
-        pred_s  = pd.Series(pred, index=df_eval.index).resample('ME').sum()
-        common  = monthly_actual.index.intersection(pred_s.index)
-        ax.plot(common, pred_s.loc[common].values,
-                color=COLORS.get(mname, 'grey'), marker='o', lw=2, ms=8,
-                label=BASE_LABELS.get(mname, mname))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
-    ax.set_ylabel('Monthly CIC Change (THB bn)', fontsize=11)
-    ax.set_title('Monthly Aggregated CIC Change\nActual vs Forecast', fontsize=12, fontweight='bold')
-    ax.set_xlabel('Train: 1997–2019  |  OOS: last 2 years shown', fontsize=9, color='dimgray')
-    ax.legend(fontsize=8)
-    ax.grid(axis='y', alpha=0.3)
-    ax = axes[1]
-    monthly_rmse = {}
-    for mname, pred in forecast_dict.items():
-        pred_s = pd.Series(pred, index=df_eval.index).resample('ME').sum()
-        common = monthly_actual.index.intersection(pred_s.index)
-        if len(common):
-            e = monthly_actual.loc[common] - pred_s.loc[common]
-            monthly_rmse[mname] = np.sqrt(np.mean(e**2))
-    bar_labels = [BASE_LABELS.get(m, m) for m in monthly_rmse]
-    bars = ax.bar(bar_labels,
-                  list(monthly_rmse.values()),
-                  color=[COLORS.get(m, 'grey') for m in monthly_rmse], alpha=0.85)
-    for bar, val in zip(bars, monthly_rmse.values()):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                f'{val:.1f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Monthly RMSE (THB billion)', fontsize=11)
-    ax.set_title('Monthly Monitor Accuracy', fontsize=12, fontweight='bold')
-    ax.set_xticklabels(bar_labels, rotation=15, ha='right', fontsize=8)
-    ax.grid(axis='y', alpha=0.3)
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig7_monthly_monitor.png')
-
-
-def plot_fig8_garch(train_index, residuals, garch_res, save_dir='.'):
+def plot_garch_volatility(train_index, residuals, garch_res, save_dir='.'):
     fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
     n   = len(residuals)
     idx = train_index[:n]
@@ -1072,7 +899,7 @@ def plot_fig8_garch(train_index, residuals, garch_res, save_dir='.'):
     ax.axhline(0, color='black', lw=0.5)
     ax.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
                alpha=0.15, color='red', label='COVID 2020')
-    ax.set_title('Old_2022 — Training Residuals', fontsize=12, fontweight='bold')
+    ax.set_title('Daily_Baseline — Training Residuals', fontsize=12, fontweight='bold')
     ax.set_ylabel('Residual (THB bn)')
     ax.legend(fontsize=9)
     ax = axes[1]
@@ -1088,16 +915,17 @@ def plot_fig8_garch(train_index, residuals, garch_res, save_dir='.'):
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     fig.tight_layout()
-    _save(fig, save_dir, 'fig8_garch_volatility.png')
+    _save(fig, save_dir, 'fig3_garch_volatility.png')
 
 
-def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
+def plot_seasonal_pattern(df, fitted_models_dict, hol, save_dir='.'):
     """
     Seasonal CIC pattern: monthly end-of-month CIC level by year.
     Y-axis  : CIC level (THB billion)
     X-axis  : Month (Jan–Dec)
     Lines   : each year (last 10 years highlighted, older years faded)
-    Fan     : 3-model forecast fan — Old_2022, ExtDummy, D1 — with shaded range
+    Fan     : 3-model forecast fan — Daily_Baseline / Daily_AdaptiveDrift /
+              Daily_AdaptiveSeasonal — with shaded range across models
     """
     df_lev = df[df['Currency'].notna()].copy()
     eom    = df_lev['Currency'].resample('ME').last().dropna()
@@ -1131,12 +959,12 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     fc_end    = (last_date + pd.Timedelta(days=45)).strftime('%Y-%m-%d')
 
     fan_models = {k: v for k, v in fitted_models_dict.items()
-                  if k in ('Old_2022', 'ExtDummy', 'D1', 'Model3')}
+                  if k in ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')}
     fan_fc = {}  # mname -> {(yr, mo): eom_level}
 
     for mname, mdl in fan_models.items():
         try:
-            X_fut = generate_future_exog('Old_2022' if mname in ('D1', 'Model3') else mname,
+            X_fut = generate_future_exog('Daily_Baseline' if mname in ('Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal') else mname,
                                          fc_start, fc_end, hol)
             if len(X_fut) == 0:
                 continue
@@ -1163,9 +991,9 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
                                 [min(vals), min(vals)], [max(vals), max(vals)],
                                 color='#cccccc', alpha=0.5, zorder=7)
 
-        fan_label_map = {'Old_2022': 'Old_2022 fc', 'ExtDummy': 'ExtDummy fc',
-                         'D1': 'D1 fc', 'Model3': 'Model3 fc'}
-        for mname in ('Old_2022', 'ExtDummy', 'D1', 'Model3'):
+        fan_label_map = {k: f'{k} fc' for k in
+                         ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')}
+        for mname in ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal'):
             eom_fc = fan_fc.get(mname, {})
             if not eom_fc:
                 continue
@@ -1182,7 +1010,7 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     ax.set_xticklabels(month_names, fontsize=11)
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year\n'
-                 '(dots = next-month forecast; shaded band = range across Old_2022 / D1 / Model3)',
+                 '(dots = next-month forecast; shaded band = range across Daily_Baseline / Daily_AdaptiveDrift / Daily_AdaptiveSeasonal)',
                  fontsize=13, fontweight='bold')
     ax.legend(fontsize=8.5, ncol=1, loc='upper left',
               bbox_to_anchor=(1.01, 1), borderaxespad=0,
@@ -1190,542 +1018,7 @@ def plot_fig9_seasonal_cic(df, fitted_models_dict, hol, save_dir='.'):
     ax.grid(alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
     fig.tight_layout()
-    _save(fig, save_dir, 'fig9_seasonal_cic.png')
-
-
-def plot_fig10_trend_slope(df_train, ss_d1_res, ss_model3_res=None, save_dir='.'):
-    """
-    fig10 — Kalman-smoothed states from adaptive models.
-
-    Panel 1: D1 local-level state ν_t on ΔCIC residuals (after calendar removal).
-             Positive ν_t = residuals trending up; negative = trending down.
-             Old_2022 treats this as fixed at 0 (horizontal dashed line).
-    Panel 2 (if Model3 provided): smooth-trend slope component (THB bn/day per day).
-             This is the rate-of-change of the trend — positive = accelerating CIC growth.
-
-    How to read:
-    - COVID 2020 hump: ν_t rises sharply (cash hoarding) then falls back
-    - Post-2021 decline: ν_t turns negative (digital payments eroding cash demand)
-    - Old_2022's zero line shows what a static model misses
-    """
-    if ss_d1_res is None:
-        print('  ⚠ plot_fig10: D1 model is None, skipping.')
-        return
-
-    n_train = len(df_train)
-
-    # D1: local level state = smoothed_state[0]  shape (n_states, T)
-    try:
-        d1_raw = np.asarray(ss_d1_res.uc_res.smoother_results.smoothed_state[0])
-    except Exception:
-        d1_raw = ss_d1_res.smoothed_drift()
-    d1_state = d1_raw[:n_train]
-    d1_idx   = df_train.index[:len(d1_state)]
-
-    has_m3 = (ss_model3_res is not None)
-    m3_slope = m3_idx = None
-    if has_m3:
-        try:
-            # Model3 smooth trend: state[1] = trend slope
-            m3_raw   = np.asarray(ss_model3_res.uc_res.smoother_results.smoothed_state[1])
-            m3_slope = m3_raw[:n_train]
-            m3_idx   = df_train.index[:len(m3_slope)]
-        except Exception:
-            has_m3 = False
-
-    n_panels = 2 if has_m3 else 1
-    fig, axes = plt.subplots(n_panels, 1, figsize=(15, 5 * n_panels), squeeze=False)
-
-    def _shade(ax):
-        t0 = pd.Timestamp('2020-03-01')
-        t1 = pd.Timestamp('2020-12-31')
-        tl = df_train.index[-1]
-        if t0 <= tl:
-            ax.axvspan(t0, min(t1, tl), alpha=0.12, color='red', label='COVID 2020')
-        if tl >= pd.Timestamp('2021-01-01'):
-            ax.axvline(pd.Timestamp('2021-01-01'), color='orange', lw=1.2, ls='--',
-                       alpha=0.8, label='Post-2021 digital shift')
-        ax.axhline(0, color='black', lw=0.8, ls='--', alpha=0.5,
-                   label='Zero (Old_2022 frozen constant)')
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-        ax.xaxis.set_major_locator(mdates.YearLocator(2))
-        ax.grid(alpha=0.25)
-
-    # ── Panel 1: D1 local level ──
-    ax1 = axes[0, 0]
-    ax1.plot(d1_idx, d1_state, color=COLORS['D1'], lw=1.5,
-             label='D1 local level ν_t  (Kalman-smoothed adaptive drift)')
-    _shade(ax1)
-    margin = max(0.001, (d1_state.max() - d1_state.min()) * 0.08)
-    ax1.set_ylim(d1_state.min() - margin, d1_state.max() + margin)
-    ax1.set_ylabel('Local level on ΔCIC residuals (THB bn/day)', fontsize=11)
-    ax1.set_title(
-        'Model D1 — Kalman-Smoothed Local Level ν_t on Calendar-Adjusted ΔCIC\n'
-        'Positive = upward trend in residuals; negative = downward. '
-        f'Range: [{d1_state.min():.3f}, {d1_state.max():.3f}] THB bn/day',
-        fontsize=11, fontweight='bold')
-    ax1.legend(fontsize=9, loc='upper left')
-
-    # ── Panel 2: Model3 smooth trend slope ──
-    if has_m3:
-        ax2 = axes[1, 0]
-        ax2.plot(m3_idx, m3_slope, color=COLORS['Model3'], lw=1.5,
-                 label='Model3 smooth trend slope  (THB bn/day per day)')
-        _shade(ax2)
-        margin2 = max(1e-6, (m3_slope.max() - m3_slope.min()) * 0.08)
-        ax2.set_ylim(m3_slope.min() - margin2, m3_slope.max() + margin2)
-        ax2.set_ylabel('Smooth trend slope (THB bn/day²)', fontsize=11)
-        ax2.set_title(
-            'Model3 — Kalman-Smoothed Trend Slope (rate of change of drift)\n'
-            'Positive = CIC growth accelerating; negative = decelerating. '
-            f'Range: [{m3_slope.min():.4f}, {m3_slope.max():.4f}]',
-            fontsize=11, fontweight='bold')
-        ax2.legend(fontsize=9, loc='upper left')
-
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig10_trend_slope.png')
-
-
-def plot_fig_component_decomp(eom_results, eom_results_precovid=None, save_dir='.'):
-    """
-    fig_component_decomp — Calendar vs Drift decomposition of EOM level forecasts.
-
-    How to read:
-    - Top panel: actual EOM CIC level vs each component in isolation
-        * 'Calendar-only' = what EOM level you'd get if only seasonal effects moved CIC
-        * 'Drift-only'    = what EOM level you'd get if only the trend/drift moved CIC
-        * Total forecast  = calendar + drift combined (the real model output)
-    - Bottom panel: RMSE bar chart
-        * Comp1-RMSE = error if you used only the calendar component (ignoring drift)
-        * Comp2-RMSE = error if you used only the drift component (ignoring calendar)
-        * Total-RMSE = actual model error (both components combined)
-        Comp1 & Comp2 errors are always >= Total-RMSE — the combination wins.
-    """
-    model_order = ['Old_2022', 'D1', 'Model3']
-    comp_store  = eom_results.get('_comp', {})
-    pre_comp    = (eom_results_precovid or {}).get('_comp', {})
-
-    if not comp_store:
-        print('  ⚠ plot_fig_component_decomp: no comp_store data found.')
-        return
-
-    # Merge pre-COVID + post-COVID comp data per model
-    def _merge_comp(k):
-        pre  = pre_comp.get(k, {})
-        post = comp_store.get(k, {})
-        out  = {}
-        for field in ('dates', 'comp1', 'comp2', 'total_fc', 'actual'):
-            pv = pre.get(field, [] if field != 'dates' else pd.DatetimeIndex([]))
-            sv = post.get(field, [] if field != 'dates' else pd.DatetimeIndex([]))
-            if field == 'dates':
-                out[field] = (pd.DatetimeIndex(list(pv) + list(sv))
-                              if len(pv) or len(sv) else pd.DatetimeIndex([]))
-            else:
-                out[field] = np.concatenate([np.array(pv, float), np.array(sv, float)])
-        return out
-
-    merged = {k: _merge_comp(k) for k in model_order}
-
-    # Determine year range for bar chart
-    all_years = sorted({yr for k in model_order
-                        for yr in merged[k].get('dates', pd.DatetimeIndex([])).year})
-    pre_years = set()
-    if eom_results_precovid:
-        for k in model_order:
-            pre_years |= set(pre_comp.get(k, {}).get('dates', pd.DatetimeIndex([])).year)
-
-    fig = plt.figure(figsize=(20, 13))
-    gs  = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.3,
-                           height_ratios=[1.4, 1])
-
-    # ── Top row: one time-series panel per model ──
-    for col, k in enumerate(model_order):
-        ax = fig.add_subplot(gs[0, col])
-        c  = merged[k]
-        if not len(c.get('dates', [])):
-            ax.set_title(f'{BASE_LABELS.get(k, k)}\n(no data)', fontsize=10)
-            continue
-        dates   = c['dates']
-        actual  = c['actual']
-        total   = c['total_fc']
-        comp1   = c['comp1']
-        comp2   = c['comp2']
-
-        ax.plot(dates, actual, color='#333333', lw=2, label='Actual', zorder=6)
-        ax.plot(dates, total,  color=COLORS.get(k, 'grey'), lw=1.5,
-                label='Total forecast', zorder=5)
-        ax.plot(dates, comp1, color='#1f77b4', lw=1.2, ls='--',
-                label='Calendar-only', alpha=0.85)
-        ax.plot(dates, comp2, color='#ff7f0e', lw=1.2, ls=':',
-                label='Drift-only', alpha=0.85)
-
-        # Shade pre-COVID
-        if pre_years:
-            for yr in pre_years:
-                msk = dates.year == yr
-                if msk.sum() >= 2:
-                    ax.axvspan(dates[msk][0], dates[msk][-1], alpha=0.07,
-                               color='green', zorder=0)
-
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-        ax.xaxis.set_major_locator(mdates.YearLocator(2))
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
-        ax.set_title(f'{BASE_LABELS.get(k, k)} — EOM Level Components', fontsize=10, fontweight='bold')
-        ax.set_ylabel('CIC Level (THB bn)', fontsize=9)
-        ax.legend(fontsize=7.5, loc='upper left', ncol=2)
-        ax.grid(alpha=0.2)
-
-    # ── Bottom row: RMSE breakdown bar chart per model ──
-    ax_bar = fig.add_subplot(gs[1, :])
-    x      = np.arange(len(all_years))
-    n_m    = len(model_order)
-    n_comp = 3   # comp1-only, comp2-only, total
-    group_w = 0.8
-    bar_w   = group_w / (n_m * n_comp + n_m - 1)  # slight gap between models
-
-    hatches = ['///', '\\\\\\', '']
-    clabels = ['Cal-only RMSE', 'Drift-only RMSE', 'Total RMSE']
-    legend_handles = []
-
-    for j, k in enumerate(model_order):
-        c    = merged[k]
-        if not len(c.get('dates', [])):
-            continue
-        dates   = c['dates']
-        actual  = c['actual']
-        comp1   = c['comp1']
-        comp2   = c['comp2']
-        total   = c['total_fc']
-        clr     = COLORS.get(k, 'grey')
-
-        for ci, (comp_vals, hatch, clbl) in enumerate(
-                zip([comp1, comp2, total], hatches, clabels)):
-            vals = []
-            for yr in all_years:
-                msk = dates.year == yr
-                if msk.sum() > 0:
-                    err = actual[msk] - comp_vals[msk]
-                    vals.append(float(np.sqrt(np.mean(err ** 2))))
-                else:
-                    vals.append(np.nan)
-
-            offset = (j * (n_comp + 1) + ci - (n_m * (n_comp + 1) - 1) / 2) * bar_w
-            bars   = ax_bar.bar(x + offset, vals, bar_w * 0.92,
-                                color=clr, hatch=hatch, alpha=0.75 if ci < 2 else 0.95,
-                                edgecolor='white' if ci == 2 else clr)
-            if j == 0:
-                legend_handles.append(
-                    mpatches.Patch(facecolor='grey', hatch=hatch, alpha=0.8, label=clbl))
-
-        # model color swatch in legend
-        legend_handles.append(
-            mpatches.Patch(facecolor=clr, label=BASE_LABELS.get(k, k)))
-
-    # Shade pre-COVID year ticks
-    for i, yr in enumerate(all_years):
-        if yr in pre_years:
-            ax_bar.axvspan(i - 0.5, i + 0.5, alpha=0.07, color='green', zorder=0)
-
-    ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels([str(y) for y in all_years], rotation=45, fontsize=9)
-    ax_bar.set_ylabel('EOM Level RMSE (THB bn)', fontsize=11)
-    ax_bar.set_title(
-        'Component RMSE Breakdown by Year\n'
-        'Cal-only (///): if only calendar used  |  Drift-only (\\\\\\): if only drift used  '
-        '|  Total: full model  |  green shading = pre-COVID',
-        fontsize=10, fontweight='bold')
-    ax_bar.legend(handles=legend_handles, fontsize=8, ncol=4, loc='upper right')
-    ax_bar.grid(axis='y', alpha=0.25)
-
-    _save(fig, save_dir, 'fig_component_decomp.png')
-
-
-def plot_fig_oos_error(m_data, save_dir='.'):
-    """
-    fig_oos_error — Daily OOS forecast errors for all 3 models.
-
-    How to read:
-    - Top panel: signed daily error = actual ΔCIC minus model forecast.
-        Positive = model under-forecast (CIC rose more than expected).
-        Negative = model over-forecast (CIC fell more than expected).
-        Large spikes = holiday/shock events the model missed.
-    - Bottom panel: 3-month rolling RMSE — shows whether errors are shrinking
-        or growing over time. A rising line = model degrading in that period.
-    """
-    model_order = ['Old_2022', 'D1', 'Model3']
-    df_eval     = m_data['df_eval']
-    forecasts   = m_data['forecasts']
-    actual      = df_eval['Change'].values
-    dates       = df_eval.index
-
-    errors = {}
-    for k in model_order:
-        pred = forecasts.get(k)
-        if pred is not None:
-            errors[k] = actual - pred
-
-    if not errors:
-        print('  ⚠ plot_fig_oos_error: no forecast data.')
-        return
-
-    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
-
-    # ── Panel 1: signed daily error ──
-    ax1 = axes[0]
-    ax1.axhline(0, color='black', lw=0.7, ls='--', alpha=0.5)
-    for k in model_order:
-        if k not in errors:
-            continue
-        rmse = float(np.sqrt(np.mean(errors[k] ** 2)))
-        ax1.plot(dates, errors[k], color=COLORS.get(k, 'grey'), lw=0.8, alpha=0.7,
-                 label=f'{BASE_LABELS.get(k, k)}  RMSE={rmse:.2f}')
-    ax1.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
-                alpha=0.10, color='red', label='COVID 2020')
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax1.xaxis.set_major_locator(mdates.YearLocator())
-    ax1.set_ylabel('Forecast Error  (actual − forecast)  THB bn/day', fontsize=11)
-    ax1.set_title(
-        f'OOS Daily Forecast Error  (Train: {m_data["train_label"]}  |  '
-        f'OOS: {dates[0]:%b %Y} → {dates[-1]:%b %Y})\n'
-        'Positive = under-forecast; Negative = over-forecast',
-        fontsize=12, fontweight='bold')
-    ax1.legend(fontsize=9, loc='upper right')
-    ax1.grid(axis='y', alpha=0.2)
-
-    # ── Panel 2: 3-month rolling RMSE ──
-    ax2 = axes[1]
-    window = 66  # ≈ 3 months of business days
-    for k in model_order:
-        if k not in errors:
-            continue
-        err_s  = pd.Series(errors[k], index=dates)
-        sq_err = err_s ** 2
-        roll_rmse = np.sqrt(sq_err.rolling(window, min_periods=20).mean())
-        ax2.plot(dates, roll_rmse, color=COLORS.get(k, 'grey'), lw=1.5,
-                 label=BASE_LABELS.get(k, k))
-    ax2.axvspan(pd.Timestamp('2020-03-01'), pd.Timestamp('2020-12-31'),
-                alpha=0.10, color='red', label='COVID 2020')
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax2.xaxis.set_major_locator(mdates.YearLocator())
-    ax2.set_ylabel('3-Month Rolling RMSE (THB bn/day)', fontsize=11)
-    ax2.set_title(
-        '3-Month Rolling OOS RMSE\n'
-        'Rising line = errors growing in that window; flat = stable accuracy',
-        fontsize=12, fontweight='bold')
-    ax2.legend(fontsize=9, loc='upper right')
-    ax2.grid(axis='y', alpha=0.2)
-
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig_oos_error.png')
-
-
-def plot_fig11_eom_level(eom_results, eom_results_precovid=None, save_dir='.'):
-    """
-    fig11 — Actual vs forecast end-of-month CIC level, all 3 models.
-
-    Left  : EOM level traces — actual (black) vs all model forecasts.
-    Right : per-year RMSE bars including pre-COVID years when precovid results provided.
-    """
-    model_order = ['Old_2022', 'D1', 'Model3']
-
-    # Merge pre-COVID + post-COVID results for the bar chart
-    combined = {}
-    for k in model_order:
-        pre  = eom_results_precovid.get(k, {}) if eom_results_precovid else {}
-        post = eom_results.get(k, {})
-        pre_dates  = pre.get('dates', pd.DatetimeIndex([]))
-        post_dates = post.get('dates', pd.DatetimeIndex([]))
-        if len(pre_dates) == 0 and len(post_dates) == 0:
-            combined[k] = {'dates': pd.DatetimeIndex([]), 'actual': np.array([]),
-                           'forecast': np.array([]), 'errors': np.array([]), 'RMSE': np.nan}
-        else:
-            all_dates = pre_dates.append(post_dates)
-            all_actual = np.concatenate([pre.get('actual', np.array([])),
-                                          post.get('actual', np.array([]))])
-            all_fc     = np.concatenate([pre.get('forecast', np.array([])),
-                                          post.get('forecast', np.array([]))])
-            all_err    = all_actual - all_fc
-            combined[k] = {'dates': all_dates, 'actual': all_actual, 'forecast': all_fc,
-                           'errors': all_err, 'RMSE': float(np.sqrt(np.mean(all_err**2)))}
-
-    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
-
-    # Left — actual vs forecast level traces (post-COVID period only for clarity)
-    ax = axes[0]
-    ref = eom_results.get('Old_2022', {})
-    if len(ref.get('dates', [])):
-        ax.plot(ref['dates'], ref['actual'], color='#333333', lw=2.2,
-                label='Actual EOM CIC Level', zorder=6)
-    for k in model_order:
-        r = eom_results.get(k, {})
-        if len(r.get('dates', [])) == 0:
-            continue
-        rmse = r.get('RMSE', np.nan)
-        lw   = 2.0 if k in ('D1', 'Model3') else 1.2
-        ax.plot(r['dates'], r['forecast'], color=COLORS.get(k, 'grey'),
-                lw=lw, alpha=0.85,
-                label=f'{BASE_LABELS.get(k, k)}  RMSE={rmse:.1f}')
-    ax.axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2020-12-31'),
-               alpha=0.10, color='red', label='COVID 2020')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.set_ylabel('EOM CIC Level (THB billion)', fontsize=11)
-    ax.set_title('End-of-Month CIC Level — Actual vs Forecast (1-month-ahead, rolling refit)',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=8.5, loc='upper left')
-    ax.grid(alpha=0.25)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
-
-    # Right — per-year RMSE bars (combined pre-COVID + post-COVID)
-    ax = axes[1]
-    all_dates_ref = combined.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
-    years = sorted(set(all_dates_ref.year)) if len(all_dates_ref) else []
-    x = np.arange(len(years))
-    n = len(model_order)
-    w = 0.8 / n
-    for j, k in enumerate(model_order):
-        r    = combined.get(k, {})
-        vals = []
-        for yr in years:
-            mask = r.get('dates', pd.DatetimeIndex([])).year == yr
-            vals.append(float(np.sqrt(np.mean(r['errors'][mask] ** 2)))
-                        if mask.sum() > 0 else np.nan)
-        offset = (j - n / 2 + 0.5) * w
-        bars   = ax.bar(x + offset, vals, w * 0.9,
-                        color=COLORS.get(k, 'grey'), alpha=0.85,
-                        label=BASE_LABELS.get(k, k))
-        for bar, val in zip(bars, vals):
-            if not np.isnan(val):
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + 0.5,
-                        f'{val:.0f}', ha='center', va='bottom', fontsize=6.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(y) for y in years], rotation=45, fontsize=9)
-    ax.set_ylabel('EOM Level RMSE (THB billion)', fontsize=11)
-    ax.set_title('1-Month-Ahead EOM Level RMSE by Year\n(lower = better)',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(axis='y', alpha=0.3)
-
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig11_eom_level.png')
-
-
-def plot_fig_model_comparison(m_data, rolling_metrics, eom_results,
-                               eom_results_precovid=None, save_dir='.'):
-    """
-    fig_model_comparison — 3-panel summary comparing all evaluation types.
-
-    Panel 1 (top)    : OOS daily ΔCIC — actual vs all 3 model forecasts (2020-2026).
-    Panel 2 (middle) : Rolling yearly backtest RMSE (expanding-window, ARIMAX = Old_2022).
-    Panel 3 (bottom) : Rolling monthly EOM RMSE by year — all 3 models, incl. pre-COVID.
-    """
-    all_models   = ['Old_2022', 'D1', 'Model3']
-    forecasts    = m_data['forecasts']
-    df_eval      = m_data['df_eval']
-    train_label  = m_data['train_label']
-    actual       = df_eval['Change'].values
-    dates        = df_eval.index
-
-    fig, axes = plt.subplots(3, 1, figsize=(16, 16))
-
-    # ── Panel 1: OOS daily ΔCIC ──
-    ax = axes[0]
-    ax.plot(dates, actual, color='#333333', lw=1.2, label='Actual', zorder=5)
-    for mname in all_models:
-        pred = forecasts.get(mname)
-        if pred is None:
-            continue
-        rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
-        ax.plot(dates, pred, color=COLORS.get(mname, 'grey'), lw=1.5, alpha=0.75,
-                label=f'{BASE_LABELS.get(mname, mname)}  RMSE={rmse:.2f}')
-    ax.axhline(0, color='black', lw=0.5, ls='--')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.set_ylabel('Daily ΔCIC (THB bn)', fontsize=10)
-    ax.set_title(f'Out-of-Sample Daily Forecast  (Train: {train_label}  |  OOS: {dates[0]:%b %Y}→{dates[-1]:%b %Y})',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=9, loc='upper right')
-    ax.grid(axis='y', alpha=0.2)
-
-    # ── Panel 2: Rolling backtest RMSE (Old_2022 only — ARIMAX core models) ──
-    ax = axes[1]
-    all_wl = []
-    for mname, wdict in rolling_metrics.items():
-        all_wl = list(wdict.keys())
-        break
-    x = np.arange(len(all_wl))
-    n_rm = len(rolling_metrics)
-    w    = 0.8 / max(n_rm, 1)
-    for j, (mname, wdict) in enumerate(rolling_metrics.items()):
-        vals = [wdict.get(wl, {}).get('RMSE', np.nan) for wl in all_wl]
-        offset = (j - n_rm / 2 + 0.5) * w
-        ax.bar(x + offset, vals, w * 0.9, color=COLORS.get(mname, 'grey'), alpha=0.85,
-               label=BASE_LABELS.get(mname, mname))
-    ax.set_xticks(x)
-    ax.set_xticklabels(all_wl, rotation=40, fontsize=8, ha='right')
-    ax.set_ylabel('Daily ΔCIC RMSE (THB bn)', fontsize=10)
-    ax.set_title('Rolling Yearly Backtest — Expanding-Window RMSE',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=9)
-    ax.grid(axis='y', alpha=0.2)
-
-    # ── Panel 3: Rolling monthly EOM RMSE by year (all 3 models + pre-COVID) ──
-    ax = axes[2]
-    # Merge pre-COVID and post-COVID results
-    combined_eom = {}
-    for k in all_models:
-        pre  = eom_results_precovid.get(k, {}) if eom_results_precovid else {}
-        post = eom_results.get(k, {})
-        pre_d  = pre.get('dates', pd.DatetimeIndex([]))
-        post_d = post.get('dates', pd.DatetimeIndex([]))
-        if len(pre_d) == 0 and len(post_d) == 0:
-            combined_eom[k] = {'dates': pd.DatetimeIndex([]), 'errors': np.array([])}
-        else:
-            combined_eom[k] = {
-                'dates':  pre_d.append(post_d),
-                'errors': np.concatenate([pre.get('errors', np.array([])),
-                                          post.get('errors', np.array([]))]),
-            }
-
-    ref_dates_eom = combined_eom.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
-    years_eom = sorted(set(ref_dates_eom.year)) if len(ref_dates_eom) else []
-    x2  = np.arange(len(years_eom))
-    n3  = len(all_models)
-    w3  = 0.8 / n3
-    for j, k in enumerate(all_models):
-        r    = combined_eom[k]
-        vals = []
-        for yr in years_eom:
-            mask = r.get('dates', pd.DatetimeIndex([])).year == yr
-            vals.append(float(np.sqrt(np.mean(r['errors'][mask] ** 2)))
-                        if mask.sum() > 0 else np.nan)
-        offset = (j - n3 / 2 + 0.5) * w3
-        bars = ax.bar(x2 + offset, vals, w3 * 0.9, color=COLORS.get(k, 'grey'), alpha=0.85,
-                      label=BASE_LABELS.get(k, k))
-        for bar, val in zip(bars, vals):
-            if not np.isnan(val):
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + 0.3,
-                        f'{val:.0f}', ha='center', va='bottom', fontsize=6.5)
-    # shade pre-COVID years
-    pre_yrs = set()
-    if eom_results_precovid:
-        pre_ref = eom_results_precovid.get('Old_2022', {}).get('dates', pd.DatetimeIndex([]))
-        pre_yrs = set(pre_ref.year) if len(pre_ref) else set()
-    for i, yr in enumerate(years_eom):
-        if yr in pre_yrs:
-            ax.axvspan(i - 0.5, i + 0.5, alpha=0.07, color='green', zorder=0)
-    ax.set_xticks(x2)
-    ax.set_xticklabels([str(y) for y in years_eom], rotation=45, fontsize=9)
-    ax.set_ylabel('EOM Level RMSE (THB bn)', fontsize=10)
-    ax.set_title('Rolling Monthly EOM Level RMSE by Year\n(green shading = pre-COVID normal period)',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=9)
-    ax.grid(axis='y', alpha=0.2)
-
-    fig.tight_layout(pad=2.5)
-    _save(fig, save_dir, 'fig_model_comparison.png')
+    _save(fig, save_dir, 'fig4_seasonal_pattern.png')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1736,13 +1029,13 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
     """
     CIC_output.xlsx — 3 tabs:
 
-    Daily       : date | CIC actual | Original | Adaptive  (all CIC level, 1-step-ahead)
+    Daily       : date | CIC actual | one column per model (CIC level, 1-step-ahead)
                   OOS 2020-present + 2 months forward; yellow = forecast rows
 
-    Monthly EOM : date | CIC actual | CIC actual change | Original EOM | Adaptive EOM
+    Monthly EOM : date | CIC actual | CIC actual change | one EOM column per model
                   Yellow = forecast rows
 
-    Summary     : rows = Original / Adaptive / Avg Post-COVID Seasonal (SUMPRODUCT formula)
+    Summary     : rows = one per model + Avg Post-COVID Seasonal (SUMPRODUCT formula)
                   cols = next 2 forecast months
                   values = monthly CIC change
     """
@@ -1764,8 +1057,8 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
     df_eval    = main['df_eval']
     forecasts  = main['forecasts']          # mname -> np.array of daily change forecasts
 
-    # Display order: Original then Adaptive
-    MODEL_ORDER = ['Old_2022', 'D1', 'Model3']
+    # Display order: baseline first, then the adaptive variants
+    MODEL_ORDER = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
 
     last_actual     = df['Currency'].dropna().index.max()
     last_actual_eom = df['Currency'].dropna().resample('ME').last().dropna().index.max()
@@ -1794,7 +1087,7 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
         if mdl is None:
             continue
         try:
-            key = 'Old_2022' if mname in ('D1', 'Model3') else mname
+            key = 'Daily_Baseline' if mname in ('Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal') else mname
             X_fut = generate_future_exog(key, fc_start, fc_end, hol)
             if not len(X_fut):
                 continue
@@ -1869,7 +1162,7 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
 
     # ── Build Summary DataFrame ──
     # Columns = next 2 forecast months, Rows = 2 models + avg seasonal
-    summary_models   = ['Old_2022', 'D1', 'Model3']
+    summary_models   = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
     summary_row_lbls = [BASE_LABELS.get(m, m) for m in summary_models] + ['Avg Post-COVID Seasonal']
 
     # Identify the 2 forecast month-end dates (strictly after last actual EOM)
@@ -2139,7 +1432,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
         # ── Level EOM Metrics (Model D backtest) ──
         if eom_results:
             eom_rows = []
-            model_order = ['Old_2022', 'D1', 'Model3']
+            model_order = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
             for k in model_order:
                 r = eom_results.get(k, {})
                 if not len(r.get('dates', [])):
@@ -2160,7 +1453,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
 
             # Also write detail rows (date, actual, forecast, error per model)
             detail_frames = []
-            for k in ['Old_2022', 'D1', 'Model3']:
+            for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
                 r = eom_results.get(k, {})
                 if not len(r.get('dates', [])):
                     continue
@@ -2180,7 +1473,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
             comp_store = eom_results.get('_comp', {})
             if comp_store:
                 comp_detail_frames = []
-                for k in ['Old_2022', 'D1', 'Model3']:
+                for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
                     c = comp_store.get(k, {})
                     if not len(c.get('dates', [])):
                         continue
@@ -2202,7 +1495,7 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
                     # Comp1_RMSE = error using calendar dummies alone (no drift)
                     # Comp2_RMSE = error using drift alone (no calendar)
                     sum_rows = []
-                    for k in ['Old_2022', 'D1', 'Model3']:
+                    for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
                         c = comp_store.get(k, {})
                         if not len(c.get('dates', [])):
                             continue
@@ -2312,7 +1605,7 @@ def main():
     ]
     # Horizon RMSE origins: spread across the OOS period
     HORIZON_ORIGINS = ['2020-01-01', '2022-06-01', '2024-01-01']
-    ALL_MODELS      = list(REGS.keys())   # ['Old_2022']
+    ALL_MODELS      = list(REGS.keys())   # ['Daily_Baseline']
     CORE_MODELS     = ALL_MODELS
 
     sep = '=' * 65
@@ -2337,9 +1630,9 @@ def main():
 
     # ── 2. Fig 1 ──
     print('\n[2] Figure 1 — CIC overview...')
-    plot_fig1_overview(df)
+    plot_data_overview(df)
 
-    # ── 3. Fit all models on both configs (ARIMAX + D1) ──
+    # ── 3. Fit all models on both configs (ARIMAX + Daily_AdaptiveDrift) ──
     print('\n[3] Fitting models on both training configurations...')
     print(f'  {"Model":<20} {"AIC":>10} {"BIC":>10} {"σ":>7} {"AR":>6} {"MA":>6}  [config]')
     print('  ' + '-' * 72)
@@ -2363,34 +1656,34 @@ def main():
                   f'AIC={mdl.aic:9.1f}  BIC={mdl.bic:9.1f}  '
                   f'σ={mdl.sigma:.3f}  AR={mdl.ar1:.3f}  MA={mdl.ma1:.3f}')
 
-        # D1 state-space variant
-        X_tr_ss, _ = get_X(df_train, 'Old_2022')
+        # Daily_AdaptiveDrift state-space variant
+        X_tr_ss, _ = get_X(df_train, 'Daily_Baseline')
         try:
-            d1_mdl = StateSpaceTrendModel('D1').fit(df_train['Change'].values, X_tr_ss)
-            fitted_models['D1'] = d1_mdl
-            print(f'  [{"D1 ("+lbl+")":<28}]  AIC={d1_mdl.aic:9.1f}  BIC={d1_mdl.bic:9.1f}')
+            d1_mdl = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(df_train['Change'].values, X_tr_ss)
+            fitted_models['Daily_AdaptiveDrift'] = d1_mdl
+            print(f'  [{"Daily_AdaptiveDrift ("+lbl+")":<28}]  AIC={d1_mdl.aic:9.1f}  BIC={d1_mdl.bic:9.1f}')
         except Exception as exc:
-            print(f'  ⚠ D1 ({lbl}): {exc}')
+            print(f'  ⚠ Daily_AdaptiveDrift ({lbl}): {exc}')
 
-        # Model3 — smooth trend with trailing-window OLS
-        X_tr_m3, _ = get_X(df_train, 'Old_2022')
+        # Daily_AdaptiveSeasonal — smooth trend with trailing-window OLS
+        X_tr_m3, _ = get_X(df_train, 'Daily_Baseline')
         try:
-            m3_mdl = Model3TrendModel().fit(
+            m3_mdl = AdaptiveSeasonalModel().fit(
                 df_train['Change'].values, X_tr_m3,
                 dates=df_train.index
             )
-            fitted_models['Model3'] = m3_mdl
-            print(f'  [{"Model3 ("+lbl+")":<28}]  AIC={m3_mdl.aic:9.1f}  BIC={m3_mdl.bic:9.1f}')
+            fitted_models['Daily_AdaptiveSeasonal'] = m3_mdl
+            print(f'  [{"Daily_AdaptiveSeasonal ("+lbl+")":<28}]  AIC={m3_mdl.aic:9.1f}  BIC={m3_mdl.bic:9.1f}')
         except Exception as exc:
-            print(f'  ⚠ Model3 ({lbl}): {exc}')
+            print(f'  ⚠ Daily_AdaptiveSeasonal ({lbl}): {exc}')
 
         # Forecasts and metrics for eval period
         forecasts     = {}
         bench_metrics = {}
         actual_arr    = df_eval['Change'].values
         for mname, mdl in fitted_models.items():
-            if mname in ('D1', 'Model3'):
-                X_ev, _ = get_X(df_eval, 'Old_2022')
+            if mname in ('Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal'):
+                X_ev, _ = get_X(df_eval, 'Daily_Baseline')
             else:
                 X_ev, _ = get_X(df_eval, mname)
             pred = mdl.forecast(X_ev)
@@ -2407,7 +1700,7 @@ def main():
             'bench_metrics': bench_metrics,
         }
 
-    ALL_MODELS_WITH_SS = ALL_MODELS + ['D1', 'Model3']  # ['Old_2022', 'D1', 'Model3']
+    ALL_MODELS_WITH_SS = ALL_MODELS + ['Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']  # ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
 
     # ── 4. Benchmark metrics ──
     print('\n[4] Benchmark metrics:')
@@ -2433,16 +1726,16 @@ def main():
         run_diagnostics(res, label=model_label(mname, m_lbl))
 
     # ── 6. ARCH + GARCH ──
-    print('\n[6] ARCH-LM + GARCH(1,1) on Old_2022 residuals...')
-    old_res = np.asarray(residuals['Old_2022'], float)
+    print('\n[6] ARCH-LM + GARCH(1,1) on Daily_Baseline residuals...')
+    old_res = np.asarray(residuals['Daily_Baseline'], float)
     old_res = old_res[~np.isnan(old_res)]
     arch_stat, arch_pval, _, _ = het_arch(old_res, nlags=10)
     print(f'  ARCH-LM(10): stat={arch_stat:.3f}, p={arch_pval:.4f}  '
           f'→ {"⚠ ARCH effects present" if arch_pval<0.05 else "✓ no ARCH"}')
     garch_res = fit_garch(old_res)
 
-    # ── 7. Rolling backtest (all 7 windows, Original model) ──
-    print('\n[7] Rolling backtest (expanding window, 7 periods, Original model)...')
+    # ── 7. Rolling backtest (all 7 windows, Daily_Baseline) ──
+    print('\n[7] Rolling backtest (expanding window, 7 periods, Daily_Baseline)...')
     rolling_metrics = rolling_backtest(df, CORE_MODELS, BACKTEST_WINDOWS)
     win_labels = [f'{es[:7]}→{ee[:7]}' for _, es, ee in BACKTEST_WINDOWS]
     print('\n  Rolling RMSE summary:')
@@ -2469,20 +1762,8 @@ def main():
             row += f'  {val:>8.3f}' if not np.isnan(val) else f'  {"—":>8}'
         print(row)
 
-    # ── 8b. D1 fit on main training data (for fig10 drift plot) ──
-    print('\n[8b] Fitting D1 on cfg_main training data (for drift visualisation)...')
-    m_df_train = configs_results['cfg_main']['df_train']
-    X_tr_ss, _ = get_X(m_df_train, 'Old_2022')
-    ss_d1 = m_fitted.get('D1')
-    if ss_d1 is None:
-        try:
-            ss_d1 = StateSpaceTrendModel('D1').fit(m_df_train['Change'].values, X_tr_ss)
-            print(f'  D1  AIC={ss_d1.aic:.1f}  BIC={ss_d1.bic:.1f}')
-        except Exception as exc:
-            print(f'  ⚠ D1: {exc}')
-
-    # ── 8c. EOM level backtest — all 5 models, 2020–2025 ──
-    print('\n[8c] EOM level backtest — all 5 models, rolling monthly 2020–2025...')
+    # ── 8b. EOM level backtest — all 3 daily models, 2020–2025 ──
+    print('\n[8b] EOM level backtest — all 3 daily models, rolling monthly 2020–2025...')
     print('     (One UC fit + 4 ARIMAX fits per month-origin — ~5 min total)')
     eom_results = month_end_eom_backtest(df, hol, start_year=2020, end_year=2025)
 
@@ -2492,64 +1773,24 @@ def main():
     # ── 9. Figures ──
     print('\n[9] Generating figures...')
 
-    # cfg_main is the primary config for all comparison figures
+    # cfg_main is the primary config for all figures
     m_data = configs_results['cfg_main']
-    b_data = configs_results['cfg_benchmark']
 
-    # fig2 — Actual vs forecast; use cfg_main eval (2020–2026) for full picture
-    plot_fig2_actual_vs_forecast(m_data['df_eval'], m_data['forecasts'], m_data['train_label'])
+    # fig2 — Residual ACF/QQ on cfg_main training residuals (motivates GARCH)
+    plot_residual_diagnostics(residuals, m_lbl)
 
-    # fig3 — Error distributions; zoom to last 2 years for readability
-    zoom_start = (m_data['df_eval'].index[-1] - pd.DateOffset(years=2)).strftime('%Y-%m-%d')
-    df_zoom    = m_data['df_eval'].loc[zoom_start:]
-    fc_zoom    = {k: v[-len(df_zoom):] for k, v in m_data['forecasts'].items()}
-    plot_fig3_errors(df_zoom, fc_zoom, m_data['train_label'])
+    # fig3 — GARCH conditional volatility (drives prediction intervals)
+    plot_garch_volatility(m_data['df_train'].index, old_res, garch_res)
 
-    # fig4 — Residual ACF/QQ on cfg_main training residuals (ARIMAX only)
-    plot_fig4_residuals(residuals, m_lbl)
+    # fig4 — Seasonal EOM pattern by year + next-month forecast fan
+    print('  Generating fig4 (seasonal pattern + model fan chart)...')
+    fan_models_dict = {k: m_fitted[k] for k in
+                       ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')
+                       if k in m_fitted}
+    plot_seasonal_pattern(df, fan_models_dict, hol)
 
-    # fig5 — RMSE comparison bars: cfg_main only + rolling backtest
-    all_bench = []
-    for mname, m in configs_results['cfg_main']['bench_metrics'].items():
-        all_bench.append((BASE_LABELS.get(mname, mname), m['RMSE'], COLORS.get(mname, '#aaaaaa')))
-    eval_period_label = 'Train: 1997–2019  |  OOS: Jan 2020 – May 2026'
-    plot_fig5_rmse_comparison(all_bench, rolling_metrics, eval_period_label=eval_period_label)
-
-    plot_fig6_horizon(h_rmse, m_data['train_label'])
-
-    # fig7 — Monthly monitor; zoom to last 2 years
-    plot_fig7_monthly_monitor(df_zoom, fc_zoom, m_data['train_label'])
-
-    plot_fig8_garch(m_data['df_train'].index, old_res, garch_res)
-
-    print('  Generating fig9 (seasonal CIC + 3-model fan chart)...')
-    fan_models_dict = {k: m_fitted[k] for k in ('Old_2022', 'D1', 'Model3') if k in m_fitted}
-    plot_fig9_seasonal_cic(df, fan_models_dict, hol)
-
-    # fig10 — D1 adaptive drift + Model3 smooth trend slope
-    ss_model3 = m_fitted.get('Model3')
-    if ss_d1 is not None:
-        print('  Generating fig10 (adaptive drift + smooth trend slope)...')
-        plot_fig10_trend_slope(m_df_train, ss_d1, ss_model3_res=ss_model3)
-    else:
-        print('  ⚠ Skipping fig10 — D1 failed to fit.')
-
-    # fig11 — EOM level comparison, all 3 models (with pre-COVID merged)
-    print('  Generating fig11 (EOM level comparison, all 3 models)...')
-    plot_fig11_eom_level(eom_results, eom_results_precovid=eom_results_precovid)
-
-    # fig12 — Model comparison 3-panel
-    print('  Generating fig12 (model comparison 3-panel)...')
-    plot_fig_model_comparison(m_data, rolling_metrics, eom_results,
-                               eom_results_precovid=eom_results_precovid)
-
-    # fig_component_decomp — Calendar vs Drift decomposition
-    print('  Generating fig_component_decomp (calendar vs drift breakdown)...')
-    plot_fig_component_decomp(eom_results, eom_results_precovid=eom_results_precovid)
-
-    # fig_oos_error — OOS daily errors + rolling RMSE
-    print('  Generating fig_oos_error (OOS forecast errors)...')
-    plot_fig_oos_error(m_data)
+    # Model-comparison figures live in cic_forecast_v2.py (fig5_eom_level_backtest.png),
+    # which evaluates every candidate on the primary EOM-level KPI.
 
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
@@ -2569,10 +1810,10 @@ def main():
         lbl      = cfg_data['train_label']
         ev       = cfg_data['eval_label']
         bm       = cfg_data['bench_metrics']
-        old_rmse = bm['Old_2022']['RMSE']
+        old_rmse = bm['Daily_Baseline']['RMSE']
         best     = min(bm, key=lambda k: bm[k]['RMSE'])
         print(f'\n  ── Config ({lbl}), eval {ev} ──')
-        print(f'  {"Model":<36} {"RMSE":>6}  {"vs Old_2022":>11}  {"vs BOT paper":>13}')
+        print(f'  {"Model":<36} {"RMSE":>6}  {"vs Daily_Baseline":>11}  {"vs BOT paper":>13}')
         print('  ' + '-' * 70)
         for mname in ALL_MODELS_WITH_SS:
             if mname not in bm:
@@ -2591,7 +1832,7 @@ def main():
 
     # EOM level RMSE summary
     print(f'\n  ── EOM Level RMSE (primary KPI — 1-month-ahead, 2020–2025) ──')
-    eom_models = ['Old_2022', 'D1', 'Model3']
+    eom_models = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
     print(f'  {"Model":<20}  {"2024–25 RMSE":>14}  {"Overall RMSE":>14}')
     print('  ' + '-' * 52)
     old24 = None
@@ -2602,10 +1843,10 @@ def main():
         mask24   = r['dates'].year >= 2024
         rmse24   = np.sqrt(np.mean(r['errors'][mask24] ** 2)) if mask24.sum() > 0 else np.nan
         rmse_all = r['RMSE']
-        if k == 'Old_2022':
+        if k == 'Daily_Baseline':
             old24 = rmse24
         tag = ''
-        if k != 'Old_2022' and old24 is not None and not np.isnan(rmse24):
+        if k != 'Daily_Baseline' and old24 is not None and not np.isnan(rmse24):
             tag = '  ← better' if rmse24 < old24 else ''
         print(f'  {k:<20}  {rmse24:>14.3f}  {rmse_all:>14.3f}{tag}')
 
@@ -2622,14 +1863,14 @@ def main():
     # ── NEW MODEL SUMMARY ──
     print(f'\n  ── NEW MODEL SUMMARY ──')
     _pre_rmse = {}
-    for k in ['Old_2022', 'D1', 'Model3']:
+    for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
         r = eom_results_precovid.get(k, {})
         _pre_rmse[k] = r.get('RMSE', float('nan'))
     print(f'  Pre-COVID OOS EOM RMSE (2018-2019):  ' +
-          '  '.join(f'{k}={_pre_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+          '  '.join(f'{k}={_pre_rmse[k]:.1f}' for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']))
 
     _2025_rmse = {}
-    for k in ['Old_2022', 'D1', 'Model3']:
+    for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
         r = eom_results.get(k, {})
         if len(r.get('dates', [])):
             mask25 = r['dates'].year == 2025
@@ -2637,12 +1878,12 @@ def main():
         else:
             _2025_rmse[k] = float('nan')
     print(f'  2025 EOM RMSE:                        ' +
-          '  '.join(f'{k}={_2025_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+          '  '.join(f'{k}={_2025_rmse[k]:.1f}' for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']))
 
     _comp_st = eom_results.get('_comp', {})
     _c1_rmse = {}
     _c2_rmse = {}
-    for k in ['Old_2022', 'D1', 'Model3']:
+    for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']:
         c = _comp_st.get(k, {})
         if len(c.get('comp1', [])) and len(c.get('actual', [])):
             act  = np.array(c['actual'])
@@ -2653,9 +1894,9 @@ def main():
         else:
             _c1_rmse[k] = _c2_rmse[k] = float('nan')
     print(f'  Comp1 (Calendar-only) RMSE:           ' +
-          '  '.join(f'{k}={_c1_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+          '  '.join(f'{k}={_c1_rmse[k]:.1f}' for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']))
     print(f'  Comp2 (Drift-only)    RMSE:           ' +
-          '  '.join(f'{k}={_c2_rmse[k]:.1f}' for k in ['Old_2022', 'D1', 'Model3']))
+          '  '.join(f'{k}={_c2_rmse[k]:.1f}' for k in ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']))
 
     print(f'\n  All figures and cic_forecast_output.xlsx saved to: {os.path.abspath(".")}')
     print(sep + '\n')

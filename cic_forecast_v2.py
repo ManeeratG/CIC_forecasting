@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """
 CIC Forecasting v2 — Bank of Thailand
-Three-bet accuracy program targeting the primary KPI:
+Candidate models targeting the primary KPI:
 1-month-ahead end-of-month (EOM) CIC level RMSE.
 
-Candidates (see contextv2.md for the diagnosis and experiment log):
-  Bet 1  M1  — direct monthly EOM model (SARIMA / UC, 12-month seasonality)
-  Bet 2  D2  — smooth-trend UC on the calendar-adjusted CIC level, COVID-robust
-  Bet 3  CMB — inverse-MSE combination of {Old_2022, M1, D2}
+See CIC_model_document.md for the problem statement, methodology and results.
 
-Baselines run in the same harness for continuity: Old_2022 (TwoStepARIMAX)
-and D1 (local-level state-space) imported from cic_forecast.py.
+Model names follow one scheme — <Frequency>_<Method>, blends are Blend_<members>:
+  Daily_Baseline      the 2022 EViews model (OLS on 55 calendar dummies + ARMA)
+  Daily_AdaptiveDrift local-level state-space drift on the daily residuals  (v1)
+  Monthly_SARIMA      SARIMA(1,1,1)(0,1,1,12) fitted on the monthly EOM level
+  Monthly_UC          UC local-linear-trend + 12-month seasonal on that level
+  Daily_LevelTrend    smooth-trend UC on the calendar-adjusted daily level
+  Blend_*             inverse-MSE / equal-weight combinations of the above
 
 Protocol:
   origins   = calendar month-ends 2017-12-31 → 2026-03-31 (targets 2018-01 → 2026-04)
   selection = targets 2018-01 → 2023-12   (all spec choices made here)
   holdout   = targets 2024-01 → 2026-04   (run once; decides the winner)
-  Gate 0    = harness must reproduce v1's Old_2022 = 32.86 / D1 = 33.04
+  Gate 0    = harness must reproduce v1's Daily_Baseline = 32.86 / Daily_AdaptiveDrift = 33.04
               on the 2020–2025 origin range before results are trusted.
 
 Usage:
   python cic_forecast_v2.py --gate0            # Gate-0 reproduction check only
   python cic_forecast_v2.py                    # full run (all models, all origins)
-  python cic_forecast_v2.py --models old,m1_sarima,d2_smooth
+  python cic_forecast_v2.py --models baseline,monthly_sarima,level_trend
 """
 
 import warnings
@@ -45,7 +47,7 @@ from sklearn.linear_model import LinearRegression
 # Reuse the v1 data pipeline and baseline models unchanged.
 from cic_forecast import (
     load_data, load_holiday, REGS, get_X, generate_future_exog,
-    TwoStepARIMAX, StateSpaceTrendModel,
+    TwoStepARIMAX, AdaptiveDriftModel, AdaptiveSeasonalModel,
 )
 
 CACHE_DIR   = 'backtest_cache'
@@ -64,29 +66,50 @@ LAST_ORIGIN    = '2026-03-31'                 # targets April 2026 (last complet
 #   fit_forecast(df_train, X_fut_df, last_level, target_month) ->
 #       {'eom_fc': float, 'daily_fc': np.ndarray | None}
 # df_train      : full history up to the origin (expanding window)
-# X_fut_df      : Old_2022 dummy matrix for the target month's trading days
+# X_fut_df      : Daily_Baseline dummy matrix for the target month's trading days
 # last_level    : CIC level at the origin (L_M)
 # target_month  : pd.Period of month M+1
 
-class OldModel:
-    """Baseline: v1 Old_2022 two-step ARIMAX (OLS on 55 dummies + ARIMA(1,0,1))."""
-    key = 'Old_2022'
+class BaselineModel:
+    """Daily_Baseline — the 2022 EViews model replicated: OLS on 55 calendar
+    dummies + ARIMA(1,0,1) on the residuals (two-step ARIMAX)."""
+    key = 'Daily_Baseline'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
-        X_tr, _ = get_X(df_train, 'Old_2022')
+        X_tr, _ = get_X(df_train, 'Daily_Baseline')
         mdl = TwoStepARIMAX().fit(df_train['Change'].values, X_tr)
         fc  = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
 
-class D1Model:
-    """Baseline: v1 D1 local-level state-space (adaptive drift on ΔCIC residuals)."""
-    key = 'D1'
+class AdaptiveDriftWrapper:
+    """Baseline: v1 Daily_AdaptiveDrift local-level state-space (adaptive drift on ΔCIC residuals)."""
+    key = 'Daily_AdaptiveDrift'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
-        X_tr, _ = get_X(df_train, 'Old_2022')
-        mdl = StateSpaceTrendModel('D1').fit(df_train['Change'].values, X_tr)
+        X_tr, _ = get_X(df_train, 'Daily_Baseline')
+        mdl = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(df_train['Change'].values, X_tr)
         fc  = np.asarray(mdl.forecast(X_fut_df.values), float)
+        return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
+
+
+class AdaptiveSeasonalWrapper:
+    """v1 Daily_AdaptiveSeasonal: trailing-window OLS betas (so seasonal
+    coefficients adapt) + a smooth-trend UC on the residuals."""
+    key = 'Daily_AdaptiveSeasonal'
+
+    def __init__(self, trailing_months=None):
+        self.trailing_months = trailing_months
+        if trailing_months:
+            self.key = f'Daily_AdaptiveSeasonal_{trailing_months}m'
+
+    def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
+        X_tr, _ = get_X(df_train, 'Daily_Baseline')
+        mdl = AdaptiveSeasonalModel()
+        if self.trailing_months:
+            mdl.TRAILING_MONTHS = self.trailing_months
+        mdl.fit(df_train['Change'].values, X_tr, dates=df_train.index)
+        fc = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
 
@@ -98,10 +121,10 @@ def _monthly_eom_series(df_train):
     return eom
 
 
-class M1Sarima:
+class MonthlySarimaModel:
     """Bet 1a: SARIMA(1,1,1)(0,1,1,12) on the monthly EOM level with
     2020-03 / 2020-04 intervention dummies (COVID cash-hoarding pulse)."""
-    key = 'M1_SARIMA'
+    key = 'Monthly_SARIMA'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
         eom = _monthly_eom_series(df_train)
@@ -116,10 +139,10 @@ class M1Sarima:
         return {'eom_fc': fc, 'daily_fc': None}
 
 
-class M1UC:
+class MonthlyUCModel:
     """Bet 1b: UC local-linear-trend + 12-month seasonal on the monthly EOM
     level, with COVID months (2020-03 → 2020-12) masked as missing."""
-    key = 'M1_UC'
+    key = 'Monthly_UC'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
         eom = _monthly_eom_series(df_train).astype(float)
@@ -131,10 +154,10 @@ class M1UC:
         return {'eom_fc': fc, 'daily_fc': None}
 
 
-class D2Model:
+class LevelTrendModel:
     """Bet 2: smooth-trend UC on the calendar-adjusted CIC level.
 
-    Step 1: full-sample OLS of ΔCIC on the Old_2022 dummy matrix (intercept
+    Step 1: full-sample OLS of ΔCIC on the Daily_Baseline dummy matrix (intercept
             included) → calendar mean m_t; cumulate residuals into the
             calendar-adjusted level C_t = Σ (ΔCIC_s − m_s).
     Step 2: UnobservedComponents(C_t, level=trend_spec, autoregressive=1),
@@ -147,12 +170,13 @@ class D2Model:
     def __init__(self, trend='smooth trend', covid_nan=True, key=None):
         self.trend     = trend
         self.covid_nan = covid_nan
-        self.key       = key or f"D2_{'smooth' if trend == 'smooth trend' else 'lltrend'}" \
-                                + ('' if covid_nan else '_nocovidmask')
+        suffix         = '' if trend == 'smooth trend' else '_LLT'
+        self.key       = key or ('Daily_LevelTrend' + suffix
+                                 + ('' if covid_nan else '_NoMask'))
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
         y = df_train['Change'].values.astype(float)
-        X_tr, _ = get_X(df_train, 'Old_2022')
+        X_tr, _ = get_X(df_train, 'Daily_Baseline')
         ols = LinearRegression(fit_intercept=True).fit(X_tr, y)
         resid = y - ols.predict(X_tr)
         cum = pd.Series(np.cumsum(resid), index=df_train.index)
@@ -170,18 +194,19 @@ class D2Model:
         return {'eom_fc': eom_fc, 'daily_fc': daily}
 
 
+# CLI name → model factory.  Model keys (the names that appear in every output)
+# follow one scheme: <Frequency>_<Method>, and blends are Blend_<members>.
 MODEL_FACTORY = {
-    'old':        OldModel,
-    'd1':         D1Model,
-    'm1_sarima':  M1Sarima,
-    'm1_uc':      M1UC,
-    'd2_smooth':  lambda: D2Model(trend='smooth trend', covid_nan=True),
-    'd2_lltrend': lambda: D2Model(trend='local linear trend', covid_nan=True),
-    'd2_smooth_nomask': lambda: D2Model(trend='smooth trend', covid_nan=False,
-                                        key='D2_smooth_nomask'),
+    'baseline':             BaselineModel,               # Daily_Baseline
+    'adaptive_drift':       AdaptiveDriftWrapper,        # Daily_AdaptiveDrift
+    'adaptive_seasonal':    AdaptiveSeasonalWrapper,     # Daily_AdaptiveSeasonal
+    'monthly_sarima':       MonthlySarimaModel,          # Monthly_SARIMA
+    'monthly_uc':           MonthlyUCModel,              # Monthly_UC
+    'level_trend':          lambda: LevelTrendModel(trend='smooth trend', covid_nan=True),
+    'level_trend_llt':      lambda: LevelTrendModel(trend='local linear trend', covid_nan=True),
+    'level_trend_nomask':   lambda: LevelTrendModel(trend='smooth trend', covid_nan=False),
 }
-DEFAULT_MODELS = ['old', 'd1', 'm1_sarima', 'm1_uc', 'd2_smooth', 'd2_lltrend',
-                  'd2_smooth_nomask']
+DEFAULT_MODELS = list(MODEL_FACTORY)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,7 +236,7 @@ def eom_backtest(df, hol, model_names, first_origin=FIRST_ORIGIN,
     """
     For each origin = calendar month-end M with data available:
       1. train = df up to origin (expanding window), L_M = last observed level
-      2. build the Old_2022 dummy matrix for M+1's trading days
+      2. build the Daily_Baseline dummy matrix for M+1's trading days
          (generate_future_exog — same call as v1's month_end_eom_backtest)
       3. each model forecasts the EOM level of M+1 (daily models: L_M + Σ ΔCIĈ)
       4. error = actual EOM(M+1) − forecast
@@ -256,7 +281,7 @@ def eom_backtest(df, hol, model_names, first_origin=FIRST_ORIGIN,
                 fc_start = df_next.index[0].strftime('%Y-%m-%d')
                 fc_end   = df_next.index[-1].strftime('%Y-%m-%d')
                 try:
-                    X_fut_df = generate_future_exog('Old_2022', fc_start, fc_end, hol)
+                    X_fut_df = generate_future_exog('Daily_Baseline', fc_start, fc_end, hol)
                     if len(X_fut_df) == 0:
                         continue
                     out = model.fit_forecast(df_train, X_fut_df, last_level,
@@ -268,7 +293,7 @@ def eom_backtest(df, hol, model_names, first_origin=FIRST_ORIGIN,
                 cache[okey] = out
                 dirty = True
                 if verbose:
-                    print(f'    {model.key:<18} {okey}  EOM fc={out["eom_fc"]:.1f} '
+                    print(f'    {model.key:<24} {okey}  EOM fc={out["eom_fc"]:.1f} '
                           f'actual={actual_eom:.1f}', flush=True)
 
             rows.append({'origin': origin, 'target': nm_end,
@@ -285,7 +310,7 @@ def eom_backtest(df, hol, model_names, first_origin=FIRST_ORIGIN,
         res['error'] = res['actual'] - res['forecast']
         results[model.key] = res
         if verbose:
-            print(f'  {model.key:<18} n={len(res)}  overall EOM RMSE='
+            print(f'  {model.key:<24} n={len(res)}  overall EOM RMSE='
                   f'{np.sqrt((res["error"] ** 2).mean()):.3f}', flush=True)
 
     return results, daily_store
@@ -303,7 +328,7 @@ def combine_forecasts(results, member_keys, key=None, window=12, floor=0.1,
     trailing `window` months; floored at `floor` and renormalised.
     Before `min_history` common errors exist, fall back to equal weights.
     """
-    key = key or 'CMB_' + '+'.join(member_keys)
+    key = key or 'Blend_' + '+'.join(member_keys)
     common = None
     for k in member_keys:
         idx = results[k].index
@@ -338,7 +363,7 @@ def combine_forecasts(results, member_keys, key=None, window=12, floor=0.1,
 
 
 def equal_weight(results, member_keys, key=None):
-    key = key or 'AVG_' + '+'.join(member_keys)
+    key = key or 'Blend_Avg_' + '+'.join(member_keys)
     common = None
     for k in member_keys:
         idx = results[k].index
@@ -403,7 +428,7 @@ def dm_test(e1, e2):
     return float(stat), float(p)
 
 
-def daily_guardrail(df, daily_store, baseline_key='Old_2022', lo=None, hi=None):
+def daily_guardrail(df, daily_store, baseline_key='Daily_Baseline', lo=None, hi=None):
     """Per-year daily ΔCIC RMSE per model (only models with daily paths)."""
     rows = {}
     for k, paths in daily_store.items():
@@ -464,7 +489,7 @@ def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='cic_v2_results.x
     print(f'\n  Results exported → {path}')
 
 
-def plot_eom(results, keys, path='fig_v2_eom_level.png'):
+def plot_eom(results, keys, path='fig5_eom_level_backtest.png'):
     fig, axes = plt.subplots(2, 1, figsize=(13, 9), sharex=True)
     r0 = results[keys[0]]
     axes[0].plot(r0.index, r0['actual'], 'k-', lw=2, label='Actual EOM level')
@@ -492,18 +517,18 @@ def plot_eom(results, keys, path='fig_v2_eom_level.png'):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gate0(df, hol, use_cache=True):
-    """Reproduce v1's month_end_eom_backtest numbers: Old_2022 = 32.860,
-    D1 = 33.041 over origins 2019-12-31 → 2024-12-31 (targets 2020-01 → 2025-01)."""
+    """Reproduce v1's month_end_eom_backtest numbers: Daily_Baseline = 32.860,
+    Daily_AdaptiveDrift = 33.041 over origins 2019-12-31 → 2024-12-31 (targets 2020-01 → 2025-01)."""
     print('\n──── GATE 0: v1 reproduction (origins 2019-12 → 2024-12) ────')
-    results, _ = eom_backtest(df, hol, ['old', 'd1'],
+    results, _ = eom_backtest(df, hol, ['baseline', 'adaptive_drift'],
                               first_origin='2019-12-31', last_origin='2024-12-31',
                               use_cache=use_cache, verbose=True)
     ok = True
-    for k, ref in [('Old_2022', 32.860), ('D1', 33.041)]:
+    for k, ref in [('Daily_Baseline', 32.860), ('Daily_AdaptiveDrift', 33.041)]:
         got = rmse(results[k]['error'])
         match = abs(got - ref) < 0.15
         ok &= match
-        print(f'  {k:<10} v2 harness: {got:.3f}   v1 reference: {ref:.3f}   '
+        print(f'  {k:<22} v2 harness: {got:.3f}   v1 reference: {ref:.3f}   '
               f'{"✓ match" if match else "✗ MISMATCH"}')
     print('  GATE 0 ' + ('PASSED' if ok else 'FAILED — investigate before trusting results'))
     return ok
@@ -539,15 +564,18 @@ def main():
 
     # Bet 3 — combinations (selection window decides members; defaults below)
     have = set(results)
-    if {'Old_2022', 'M1_SARIMA', 'D2_smooth'} <= have:
-        k, r = combine_forecasts(results, ['Old_2022', 'M1_SARIMA', 'D2_smooth'],
-                                 key='CMB_invMSE')
+    if {'Daily_Baseline', 'Monthly_SARIMA', 'Daily_LevelTrend'} <= have:
+        k, r = combine_forecasts(results, ['Daily_Baseline', 'Monthly_SARIMA', 'Daily_LevelTrend'],
+                                 key='Blend_InvMSE_All3')
         results[k] = r
-        k, r = equal_weight(results, ['Old_2022', 'M1_SARIMA', 'D2_smooth'],
-                            key='AVG_equal')
+        k, r = equal_weight(results, ['Daily_Baseline', 'Monthly_SARIMA', 'Daily_LevelTrend'],
+                            key='Blend_EqualWeight')
         results[k] = r
-        for pair in [('Old_2022', 'M1_SARIMA'), ('Old_2022', 'D2_smooth'),
-                     ('M1_SARIMA', 'D2_smooth')]:
+        k, r = combine_forecasts(results, ['Daily_Baseline', 'Monthly_SARIMA'],
+                                 key='Blend_Baseline_Monthly')   # ← v2 winner
+        results[k] = r
+        for pair in [('Daily_Baseline', 'Daily_LevelTrend'),
+                     ('Monthly_SARIMA', 'Daily_LevelTrend')]:
             k, r = combine_forecasts(results, list(pair))
             results[k] = r
 
@@ -556,13 +584,13 @@ def main():
     hold_tbl = summarize(results, lo=SELECTION_END + pd.Timedelta(days=1),
                          label='HOLDOUT window (targets 2024-01 → 2026-04)')
 
-    # DM tests vs Old_2022 on the holdout
-    if 'Old_2022' in results:
-        print('\n=== Diebold–Mariano vs Old_2022 (holdout, squared errors) ===')
-        base = results['Old_2022']
+    # DM tests vs Daily_Baseline on the holdout
+    if 'Daily_Baseline' in results:
+        print('\n=== Diebold–Mariano vs Daily_Baseline (holdout, squared errors) ===')
+        base = results['Daily_Baseline']
         base_h = base[base.index > SELECTION_END]
         for k, r in results.items():
-            if k == 'Old_2022':
+            if k == 'Daily_Baseline':
                 continue
             rh = r[r.index > SELECTION_END]
             common = base_h.index.intersection(rh.index)
@@ -576,8 +604,9 @@ def main():
 
     export_results(results, sel_tbl, hold_tbl, guard_tbl)
     plot_eom(results, [k for k in results if k in
-                       ('Old_2022', 'D1', 'M1_SARIMA', 'D2_smooth',
-                        'CMB_invMSE', 'CMB_Old_2022+M1_SARIMA')])
+                       ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Monthly_SARIMA',
+                        'Daily_LevelTrend', 'Blend_InvMSE_All3',
+                        'Blend_Baseline_Monthly')])
 
 
 if __name__ == '__main__':
