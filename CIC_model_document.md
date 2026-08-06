@@ -123,9 +123,16 @@ adaptivity gain. Retained in the codebase as a documented baseline, not recommen
 
 ### 5.3 `Daily_AdaptiveSeasonal` — trailing-window betas + smooth trend
 Fits the OLS step on a trailing 60-month window so seasonal betas can adapt, then a
-`smooth trend` UC on the residuals. This is the arm aimed at problem §3.3. It is
-implemented and available but was not the v2 winner; tuning the window length remains
-the most promising unexplored lever (§8).
+`smooth trend` UC on the residuals. This is the only arm that attacks problem §3.3
+directly.
+
+**Not yet evaluated under the v2 protocol** — it is absent from the selection/holdout
+tables in §6. What exists is v1's own backtest, which uses a different origin range,
+and it is encouraging: pre-COVID (2018–2019) EOM RMSE **28.94 vs the baseline's
+35.80**, with both the calendar and drift components beating the baseline (69.1/63.1
+vs 91.9/81.7). Over 2020–2025 it is worse overall (35.46 vs 32.86), driven by COVID.
+Running it through the v2 selection/holdout harness — and tuning the window length —
+is the top open lead (§8).
 
 ### 5.4 `Daily_LevelTrend` — smooth-trend UC on the calendar-adjusted level *(rejected)*
 Cumulates the OLS residuals into a calendar-adjusted level and fits a slope-drift UC
@@ -235,9 +242,11 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 
 ## 8. Open leads
 
-- **Tune `Daily_AdaptiveSeasonal`** (trailing window 36/84/120 months, or WLS with
-  exponentially discounted weights). The stale Songkran betas of §3.3 are the
-  clearest remaining accuracy lever and no v2 candidate addressed them directly.
+- **Evaluate and tune `Daily_AdaptiveSeasonal`** (already wired into the v2 harness as
+  `--models adaptive_seasonal`; then try trailing windows of 36/84/120 months or WLS
+  with exponentially discounted weights). Its pre-COVID result (§5.3) is the
+  strongest unexploited signal in the repo, and the stale Songkran betas of §3.3 are
+  the clearest remaining accuracy lever — no evaluated v2 candidate addressed them.
 - A gradient-boosting challenger on calendar + holiday-distance features, evaluated
   on the same backtest with the same selection/holdout discipline.
 - Student-t interval calibration (interval accuracy, not point accuracy).

@@ -47,7 +47,7 @@ from sklearn.linear_model import LinearRegression
 # Reuse the v1 data pipeline and baseline models unchanged.
 from cic_forecast import (
     load_data, load_holiday, REGS, get_X, generate_future_exog,
-    TwoStepARIMAX, AdaptiveDriftModel,
+    TwoStepARIMAX, AdaptiveDriftModel, AdaptiveSeasonalModel,
 )
 
 CACHE_DIR   = 'backtest_cache'
@@ -90,6 +90,26 @@ class AdaptiveDriftWrapper:
         X_tr, _ = get_X(df_train, 'Daily_Baseline')
         mdl = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(df_train['Change'].values, X_tr)
         fc  = np.asarray(mdl.forecast(X_fut_df.values), float)
+        return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
+
+
+class AdaptiveSeasonalWrapper:
+    """v1 Daily_AdaptiveSeasonal: trailing-window OLS betas (so seasonal
+    coefficients adapt) + a smooth-trend UC on the residuals."""
+    key = 'Daily_AdaptiveSeasonal'
+
+    def __init__(self, trailing_months=None):
+        self.trailing_months = trailing_months
+        if trailing_months:
+            self.key = f'Daily_AdaptiveSeasonal_{trailing_months}m'
+
+    def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
+        X_tr, _ = get_X(df_train, 'Daily_Baseline')
+        mdl = AdaptiveSeasonalModel()
+        if self.trailing_months:
+            mdl.TRAILING_MONTHS = self.trailing_months
+        mdl.fit(df_train['Change'].values, X_tr, dates=df_train.index)
+        fc = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
 
@@ -179,6 +199,7 @@ class LevelTrendModel:
 MODEL_FACTORY = {
     'baseline':             BaselineModel,               # Daily_Baseline
     'adaptive_drift':       AdaptiveDriftWrapper,        # Daily_AdaptiveDrift
+    'adaptive_seasonal':    AdaptiveSeasonalWrapper,     # Daily_AdaptiveSeasonal
     'monthly_sarima':       MonthlySarimaModel,          # Monthly_SARIMA
     'monthly_uc':           MonthlyUCModel,              # Monthly_UC
     'level_trend':          lambda: LevelTrendModel(trend='smooth trend', covid_nan=True),
