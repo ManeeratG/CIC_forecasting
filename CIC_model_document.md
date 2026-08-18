@@ -233,14 +233,31 @@ Student-t quantile rather than ±1.96σ.
 
 ## 6. Results
 
-**Protocol.** Expanding window, re-estimated at every month-end origin.
-Selection window (targets 2018-01 → 2023-12, n=72) decided every specification
-choice; the holdout (targets 2024-01 → 2026-04, n=28) was run **once** and decides
-the winner. Gate 0 (origins 2019-12 → 2024-12) is a sanity check, not a
-reproduction target — see §3.5 for why.
+**Protocol — what "selection" and "holdout" mean.** Both are backtests over the
+same expanding-window process (re-fit at every month-end origin, forecast the next
+month's EOM level), just over two non-overlapping, chronologically-ordered date
+ranges — this is a train/test split done the way it has to be done for time series
+(older data first, so nothing from the future ever leaks into a decision made in
+the past):
+
+- **Selection window** (targets 2018-01 → 2023-12, n=72 months) — the "tuning"
+  period. *Every* modelling choice in this document — which candidates to build,
+  which one wins the inverse-MSE blend, window lengths, everything in §4's rejected
+  list — was decided by looking **only** at performance here. Think of it as the
+  sandbox: as many looks as needed, because nothing here is used to claim final
+  accuracy.
+- **Holdout window** (targets 2024-01 → 2026-04, n=28 months) — data the selection
+  process never got to see or tune against. It is scored **exactly once**, after
+  every choice above was already locked in. This is what answers "does the winner
+  actually generalise, or did it just get lucky/overfit on the selection data?" —
+  the DM test column below is computed on this window for exactly that reason.
+
+A model that wins selection but loses holdout would be a red flag (overfitting to
+the tuning period); `Blend_Baseline_Monthly` below wins both, which is the clean
+result you want to see.
 
 **Primary KPI — EOM level RMSE (THB bn), re-run under the §3.5 bug fix** — see
-`fig6_eom_rmse_kpi.png`:
+`fig6_eom_rmse_kpi.png` (bar chart of the same numbers, winner marked):
 
 | Model | Selection 2018–2023 | Holdout 2024–2026 | DM vs baseline (holdout) |
 |---|---|---|---|
@@ -327,26 +344,25 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 | File | Purpose |
 |---|---|
 | `cic.prg` | The original EViews program — the specification of record |
-| `cic_forecast.py` | Single-file pipeline (merged 2026-08): data loading, the daily models (`Daily_Baseline` / `Daily_AdaptiveDrift` / `Daily_AdaptiveSeasonal`), GARCH, diagnostics, `CIC_output.xlsx` — **and** the EOM-level candidate harness (`Monthly_SARIMA`, `Monthly_UC`, `Daily_LevelTrend`, blends, selection/holdout, DM test, guardrail), entered via `--eom` |
+| `cic_forecast.py` | Single-file pipeline (merged 2026-08): data loading, the daily models (`Daily_Baseline` / `Daily_AdaptiveDrift` / `Daily_AdaptiveSeasonal`), GARCH, diagnostics — **and** the EOM-level candidate harness (`Monthly_SARIMA`, `Monthly_UC`, `Daily_LevelTrend`, blends, selection/holdout, DM test, guardrail, `fig6`'s KPI chart), entered via `--eom` |
 | `input.xlsx` | Source data (`RAW`, `holiday`) |
-| `CIC_output.xlsx` | User-facing workbook: Daily / Monthly EOM / Summary |
-| `cic_forecast_output.xlsx` | Daily-pipeline diagnostics workbook |
-| `cic_v2_results.xlsx` | EOM harness results: `EOM_Selection`, `EOM_Holdout`, `EOM_Detail`, `Daily_Guardrail` |
+| `CIC_output.xlsx` | **The one Excel deliverable.** `Daily` / `Monthly EOM` / `Summary` (from the daily pipeline) plus `EOM_Selection` / `EOM_Holdout` / `EOM_Detail` / `Daily_Guardrail` (from `--eom`) — 7 sheets, one file. Both writers only replace the sheets they own (`_excel_writer()`), so running the daily pipeline and `--eom` in either order accumulates into this one workbook rather than overwriting each other. |
+| `cic_forecast_output.xlsx` | A **separate**, pre-existing internal-diagnostics workbook (per-config eval rows, in-sample fits, rolling/horizon RMSE, GARCH params — 11 sheets aimed at model developers, not the desk). Not touched by the 2026-08 merge; still written by the daily pipeline. Say the word if you want this folded into `CIC_output.xlsx` too — it wasn't merged automatically since its audience (technical) differs from the other two files (production numbers). |
 | `R/` | Partial R reproduction of the baseline (EDA and single-window backtest) |
 | `fig1_data_overview.png` | CIC level and daily change, full sample |
 | `fig2_residual_diagnostics.png` | Residual ACF and Q-Q — motivates GARCH and fat tails |
 | `fig3_garch_volatility.png` | GARCH conditional volatility |
 | `fig4_seasonal_pattern.png` | EOM level by year with next-month forecast fan |
-| `fig5_eom_level_backtest.png` | Actual vs forecast EOM level and errors, all candidates |
-| `fig6_eom_rmse_kpi.png` | **The KPI chart** — EOM level RMSE by model, selection vs. holdout, pre- vs. post-fix |
+| `fig5_eom_level_backtest.png` | Actual vs forecast EOM level and errors, all candidates, over time |
+| `fig6_eom_rmse_kpi.png` | **The KPI chart** — EOM level RMSE by model, selection vs. holdout, winner marked. Both fig5 and fig6 are only produced by `--eom` (they compare against `Monthly_SARIMA` and the blend, which only exist in that path) — the plain `python cic_forecast.py` daily pipeline produces fig1–fig4 instead. |
 
 **How to run**
 
 ```bash
 pip install -r requirements.txt
-python cic_forecast.py                            # daily pipeline → CIC_output.xlsx + fig1–fig4
+python cic_forecast.py                            # daily pipeline → CIC_output.xlsx (Daily/Monthly EOM/Summary) + fig1-4
 python cic_forecast.py --eom --gate0               # EOM harness: post-fix sanity check only
-python cic_forecast.py --eom                       # EOM harness: full backtest → cic_v2_results.xlsx + fig5
+python cic_forecast.py --eom                       # EOM harness: full backtest → CIC_output.xlsx (+EOM_* sheets) + fig5 + fig6
 python cic_forecast.py --eom --models baseline,adaptive_drift,monthly_sarima
 ```
 
