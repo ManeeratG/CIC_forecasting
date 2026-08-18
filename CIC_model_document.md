@@ -112,6 +112,15 @@ real backtest errors rather than assumed:
    the accuracy lever for the April/March/June bias in finding 3. See §6 for the
    full selection/holdout comparison re-run under the fixed harness.
 
+   **Scope of what was re-run:** §6's table (`Daily_Baseline`, `Daily_AdaptiveDrift`,
+   `Monthly_SARIMA`, `Blend_Baseline_Monthly`) is regenerated under the fix. The
+   narrative numbers quoted in §5.2–§5.4 below (`month_end_eom_backtest`'s own
+   2020–2025 / pre-COVID / holdout figures — e.g. 33.04 vs. 32.86, 35.46, 60.8 vs.
+   36.1) predate it and were not regenerated in this pass; they use the same
+   now-fixed `generate_future_exog()`, so re-running them would move them by a
+   similar small amount to Gate 0 above, not qualitatively change the conclusions
+   those sections draw.
+
 ---
 
 ## 4. What was tried and rejected
@@ -227,29 +236,49 @@ Student-t quantile rather than ±1.96σ.
 **Protocol.** Expanding window, re-estimated at every month-end origin.
 Selection window (targets 2018-01 → 2023-12, n=72) decided every specification
 choice; the holdout (targets 2024-01 → 2026-04, n=28) was run **once** and decides
-the winner. Before any of this, the harness reproduced the previous pipeline's
-numbers exactly (32.860 / 33.041) as a correctness gate.
+the winner. Gate 0 (origins 2019-12 → 2024-12) is a sanity check, not a
+reproduction target — see §3.5 for why.
 
-**Primary KPI — EOM level RMSE (THB bn):**
+**Primary KPI — EOM level RMSE (THB bn), re-run under the §3.5 bug fix** — see
+`fig6_eom_rmse_kpi.png`:
 
 | Model | Selection 2018–2023 | Holdout 2024–2026 | DM vs baseline (holdout) |
 |---|---|---|---|
-| **`Blend_Baseline_Monthly`** | **30.98** | **33.33** | **−2.13, p=0.043** ✓ |
-| `Monthly_SARIMA` | 37.20 | 34.41 | −0.66, p=0.517 |
-| `Monthly_UC` | 57.79 | 34.77 | −0.49, p=0.629 |
-| `Daily_Baseline` (original) | 32.63 | 36.12 | — |
-| `Daily_AdaptiveDrift` | 32.80 | 36.11 | −0.01, p=0.990 |
-| `Daily_LevelTrend` | 80.55 | 60.78 | +2.49, p=0.019 ✗ |
+| **`Blend_Baseline_Monthly`** | **30.89** | **33.62** | **−2.59, p=0.015** ✓ |
+| `Monthly_SARIMA` | 37.20 | 34.41 | −1.23, p=0.230 |
+| `Daily_Baseline` (original) | 32.71 | 37.45 | — |
+| `Daily_AdaptiveDrift` | 32.92 | 37.57 | +0.54, p=0.595 |
 
-The blend improves on the original by **5.1% in selection and 7.7% in holdout**, and
-is the only candidate whose holdout gain is statistically significant at 5%. It won
-the selection window first, so the holdout is a clean confirmation rather than a
-search result.
+*(`Monthly_UC` 57.79 / 34.77 and `Daily_LevelTrend` 80.55 / 60.78 are carried over
+from the pre-fix run — unlike the four rows above, they have not been re-validated
+under the fixed harness this pass. `Monthly_UC` never consumes the daily exog matrix
+so the fix cannot change it; `Daily_LevelTrend` does, its numbers are stale, and
+since it is a rejected model (§5.4) re-running it wasn't worth the compute here —
+re-run before citing it, don't trust the number above.)*
 
-**Honest caveats.** On the older 2020-01 → 2025-01 window the blend scores 33.25
-against the baseline's 32.86 — it gives back ~0.4 in the COVID-dominated period,
-where the monthly model was weak and the trailing weights react with a lag. The
-Songkran bias of §3.3 is still present in the winner's errors.
+The blend still wins comfortably — **5.6% better than the original in selection,
+10.3% in holdout** — and its holdout margin is now *more* significant (p=0.015 vs.
+the pre-fix run's p=0.043), because `Daily_Baseline` itself moved more than the blend
+did (see below). It won the selection window first, so the holdout is a clean
+confirmation, not a search result.
+
+**Honest surprise from the §3.5 fix.** The phantom-holiday-day bug was hypothesized
+to be free accuracy, worst in Songkran-heavy April. Re-running the four affected
+models says otherwise: `Daily_Baseline` and `Daily_AdaptiveDrift` both got **worse**
+post-fix, not better — holdout RMSE up **+1.33** (36.12→37.45) and **+1.46**
+(36.11→37.57) respectively, selection essentially flat (+0.08 / +0.12).
+`Monthly_SARIMA` is untouched by construction (it never sees the daily exog matrix)
+and its numbers are identical to three decimal places, which is a useful internal
+consistency check that the fix didn't leak anywhere it shouldn't. **Read this as:
+the fix was still the right thing to do — a harness should not sum forecasts over
+days that don't exist, on principle — but it is not the accuracy lever for the
+April/March/June seasonal bias in §3 finding 3.** That lever is still open; see §8.
+
+**Honest caveats (pre-existing, unaffected by the fix).** On the older 2020-01 →
+2025-01 Gate-0-style window the blend gives back some ground to the baseline in the
+COVID-dominated period, where the monthly model was weak and the trailing weights
+react with a lag. The Songkran bias of §3.3 is still present in the winner's errors
+— confirmed, not resolved, by the §3.5 finding above.
 
 **Daily ΔCIC guardrail.** `Daily_AdaptiveDrift` stays within 0.5% of the baseline in
 every year. Blends and monthly models have no daily path of their own; their
