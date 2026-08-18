@@ -1077,8 +1077,22 @@ def plot_seasonal_pattern(df, fitted_models_dict, hol, save_dir='.'):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8d — CIC OUTPUT EXCEL (clean user-facing workbook)
+# SECTION 8d — CIC OUTPUT EXCEL (single consolidated user-facing workbook)
 # ─────────────────────────────────────────────────────────────────────────────
+# CIC_output.xlsx is the one Excel deliverable: the daily pipeline (below) and
+# the --eom harness (export_results(), Part 2) both write into it. Each writer
+# only ever replaces the sheets it owns — daily pipeline: Daily / Monthly EOM /
+# Summary; --eom harness: EOM_Selection / EOM_Holdout / EOM_Detail /
+# Daily_Guardrail — so running one after the other accumulates, it never wipes
+# the other's sheets. Whichever runs first creates the file.
+
+def _excel_writer(path):
+    """pd.ExcelWriter that appends/replaces sheets in an existing workbook
+    instead of truncating it, so two independent scripts can share one file."""
+    if os.path.exists(path):
+        return pd.ExcelWriter(path, engine='openpyxl', mode='a', if_sheet_exists='replace')
+    return pd.ExcelWriter(path, engine='openpyxl', mode='w')
+
 
 def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
     """
@@ -1251,8 +1265,8 @@ def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
     summary_df = pd.DataFrame(summary_data, index=summary_row_lbls)
     summary_df.index.name = 'Model'
 
-    # ── Write to Excel ──
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+    # ── Write to Excel (append-safe: preserves any EOM_* sheets from --eom) ──
+    with _excel_writer(path) as writer:
         daily_df.to_excel(writer, sheet_name='Daily', index=False)
         eom_df.to_excel(writer, sheet_name='Monthly EOM', index=False)
         summary_df.reset_index().to_excel(writer, sheet_name='Summary', index=False)
@@ -2391,8 +2405,11 @@ def reconciled_daily_path(daily_store, base_key, base_eom, target_eom, target):
     return base + shift
 
 
-def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='cic_v2_results.xlsx'):
-    with pd.ExcelWriter(path, engine='openpyxl') as xw:
+def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx'):
+    """Writes EOM_Selection / EOM_Holdout / EOM_Detail / Daily_Guardrail into the
+    single consolidated workbook (see _excel_writer) — append-safe, so this never
+    wipes the Daily / Monthly EOM / Summary sheets from the daily pipeline."""
+    with _excel_writer(path) as xw:
         sel_tbl.round(3).to_excel(xw, sheet_name='EOM_Selection')
         hold_tbl.round(3).to_excel(xw, sheet_name='EOM_Holdout')
         detail = []
@@ -2403,7 +2420,7 @@ def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='cic_v2_results.x
         pd.concat(detail).round(3).to_excel(xw, sheet_name='EOM_Detail', index=False)
         if guard_tbl is not None:
             guard_tbl.round(3).to_excel(xw, sheet_name='Daily_Guardrail')
-    print(f'\n  Results exported → {path}')
+    print(f'\n  Results exported → {path}  (sheets: EOM_Selection, EOM_Holdout, EOM_Detail, Daily_Guardrail)')
 
 
 def plot_eom(results, keys, path='fig5_eom_level_backtest.png'):
@@ -2427,6 +2444,76 @@ def plot_eom(results, keys, path='fig5_eom_level_backtest.png'):
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f'  Figure saved → {path}')
+
+
+# Fixed categorical order (colorblind-validated: node scripts/validate_palette.js
+# from the dataviz skill, slots 1/2/3/4, light mode) — identity, not ranked by
+# performance, so a model keeps its color across runs/figures.
+_KPI_COLOR_ORDER = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal',
+                    'Monthly_SARIMA', 'Monthly_UC', 'Daily_LevelTrend',
+                    'Blend_Baseline_Monthly', 'Blend_InvMSE_All3', 'Blend_EqualWeight']
+_KPI_PALETTE = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
+               '#e87ba4', '#4a3aa7', '#e34948', '#008300', '#6d6d63']
+
+
+def plot_kpi_comparison(sel_tbl, hold_tbl, path='fig6_eom_rmse_kpi.png'):
+    """The primary-KPI chart: EOM level RMSE by model, selection vs. holdout.
+    Ranks models by holdout RMSE (the number that decides the winner, §6 of
+    CIC_model_document.md) and marks the best one — this is the harness's own
+    answer to "which model wins", not a separate manual read of the tables.
+    """
+    common = [m for m in _KPI_COLOR_ORDER if m in sel_tbl.index and m in hold_tbl.index]
+    common += [m for m in hold_tbl.index if m in sel_tbl.index and m not in common]
+    if not common:
+        print('  (fig6 skipped: no model has both a selection and holdout RMSE)')
+        return None
+    ranked = hold_tbl.loc[common, 'RMSE'].sort_values().index.tolist()
+    best = ranked[0]
+    colors = {m: _KPI_PALETTE[_KPI_COLOR_ORDER.index(m) % len(_KPI_PALETTE)]
+             if m in _KPI_COLOR_ORDER else '#6d6d63' for m in common}
+
+    sel_rmse  = [sel_tbl.loc[m, 'RMSE']  for m in common]
+    hold_rmse = [hold_tbl.loc[m, 'RMSE'] for m in common]
+
+    fig, ax = plt.subplots(figsize=(max(9, 1.9 * len(common) + 3), 6.5))
+    x = np.arange(len(common))
+    w = 0.34
+    b1 = ax.bar(x - w/2, sel_rmse, width=w, color=[colors[m] for m in common],
+               edgecolor='white', linewidth=0.6, label=f'Selection {SELECTION_END.year - 5}–{SELECTION_END.year} (in-sample choices)')
+    b2 = ax.bar(x + w/2, hold_rmse, width=w, color=[colors[m] for m in common],
+               alpha=0.55, edgecolor='white', linewidth=0.6, hatch='///',
+               label=f'Holdout {SELECTION_END.year + 1}–{pd.Timestamp(LAST_ORIGIN).year} (evaluated once, decides the winner)')
+    for bars in (b1, b2):
+        for rect in bars:
+            h = rect.get_height()
+            ax.annotate(f'{h:.1f}', (rect.get_x() + rect.get_width() / 2, h),
+                       xytext=(0, 3), textcoords='offset points',
+                       ha='center', va='bottom', fontsize=9, color='#2b2b28')
+    best_x = common.index(best)
+    ax.annotate('BEST', xy=(best_x, max(sel_rmse[best_x], hold_rmse[best_x])),
+               xytext=(0, 16), textcoords='offset points', ha='center',
+               fontsize=9.5, fontweight='bold', color='#2b2b28',
+               arrowprops=dict(arrowstyle='-', color='#2b2b28', lw=0.8))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([m.replace('_', '\n') for m in common], fontsize=9.5)
+    ax.set_ylabel('EOM level RMSE (THB bn) — lower is better', fontsize=11)
+    ax.set_title('Primary KPI: 1-month-ahead end-of-month CIC level RMSE\n'
+                f'Winner (lowest holdout RMSE): {best} — {hold_tbl.loc[best, "RMSE"]:.1f}',
+                fontsize=13, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=8.5, frameon=False)
+    ax.grid(axis='y', alpha=0.3)
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.set_ylim(0, max(sel_rmse + hold_rmse) * 1.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Figure saved → {path}')
+    print(f'  → BEST MODEL by holdout EOM RMSE: {best} '
+         f'({hold_tbl.loc[best, "RMSE"]:.2f} vs. runner-up '
+         f'{ranked[1]}={hold_tbl.loc[ranked[1], "RMSE"]:.2f})' if len(ranked) > 1 else
+         f'  → BEST MODEL by holdout EOM RMSE: {best} ({hold_tbl.loc[best, "RMSE"]:.2f})')
+    return best
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2532,6 +2619,7 @@ def run_eom_harness(args):
                        ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Monthly_SARIMA',
                         'Daily_LevelTrend', 'Blend_InvMSE_All3',
                         'Blend_Baseline_Monthly')])
+    plot_kpi_comparison(sel_tbl, hold_tbl)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
