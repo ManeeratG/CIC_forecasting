@@ -144,6 +144,18 @@ Names follow one scheme: **`<Frequency>_<Method>`**, with combinations as
 **`Blend_<members>`**. Every model appears under these names in the code, the Excel
 outputs and the figures.
 
+The `<Frequency>` prefix is not cosmetic — it says how the model reaches the KPI:
+
+- **`Daily_*`** forecast ΔCIC for each of the ~22 trading days in the target month and
+  **sum** them: $\text{EOM} = L_M + \sum \widehat{\Delta\text{CIC}}$. Within-month
+  errors therefore accumulate rather than average out (§3 finding 1).
+- **`Monthly_*`** forecast the month-end level **directly, in one step**, from the
+  monthly EOM series. Nothing is summed, so there is no ×22 amplification.
+- **`Blend_*`** combine already-computed EOM forecasts from both families at the EOM
+  level only.
+
+`fig6a` and `fig6b` split the KPI chart along exactly this line.
+
 ### 5.1 `Daily_Baseline` — the 2022 model (benchmark)
 As described in §2. OLS on 55 calendar dummies + ARIMA(1,0,1) on residuals; EOM
 forecast = last known level + Σ of the daily forecasts for next month.
@@ -189,7 +201,7 @@ forecast variance at the 22-day horizon than the constant it replaces.
 **Lesson: handle COVID with intervention dummies, never by masking observations of an
 integrated series.**
 
-### 5.5 `Monthly_SARIMA` — direct monthly model ⭐
+### 5.5 `Monthly_SARIMA` — direct monthly model
 $$\text{SARIMA}(1,1,1)(0,1,1)_{12}$$ fitted **directly on the monthly EOM level
 series** (~345 observations), with intervention dummies for 2020-03 and 2020-04.
 
@@ -203,7 +215,10 @@ the intervention dummies absorb COVID without distorting the trend.
 via a state-space route. It performs similarly on holdout but carries a systematic
 +19 THB bn bias in the selection window, so `Monthly_SARIMA` is preferred.
 
-### 5.6 `Blend_Baseline_Monthly` — the recommended model ⭐⭐
+### 5.6 `Blend_Baseline_Monthly` — the *previous* recommended model
+*(Superseded 2026-08 by `Blend_Baseline_BreakTrend`, §5.8 — kept because the
+reasoning below still explains why blending works, and because it remains the
+fallback if the new monthly member ever has to be withdrawn.)*
 An inverse-MSE weighted average of `Daily_Baseline` and `Monthly_SARIMA`:
 
 - at each month-end, weight each member ∝ 1 / (mean squared EOM error over its last
@@ -223,7 +238,84 @@ the right mix per regime without anyone having to declare where the regimes are,
 if the blend ever degrades the weights migrate back toward the baseline on their own
 — the worst case is approximately baseline performance.
 
-### 5.7 GARCH(1,1) — prediction intervals only
+### 5.7 `Monthly_BreakTrend` — structural-break-aware EOM model ⭐
+Added 2026-08. This is the first candidate built after *mathematically identifying*
+where CIC's trend actually changes, rather than assuming a single stable regime.
+
+**Step 1 — find the breaks (Bai–Perron 1998).** Multiple-break estimation by dynamic
+programming: globally minimise the SSR of a piecewise $[1, t]$ trend regression on the
+deseasonalised log EOM level, for each number of breaks $m$, then select $m$ by BIC.
+Segment SSRs come from cumulative sums in closed form ($O(n^2)$), which is what makes
+it cheap enough to re-run at every backtest origin.
+
+**An important negative result first.** A *mean-shift* test on monthly growth finds
+**nothing** — BIC picks $m=0$. Monthly growth has sd 2.6%/mo against a mean of
+0.6%/mo, so any drift shift is buried in noise. CIC's regime change is only visible in
+the **trend of the level**, which is what the segmented-trend regression above tests.
+There the evidence is overwhelming: $m=0 \to m=1$ gives $F \approx 941$.
+
+BIC selects **m=5 breaks** (see `fig7_structural_breaks.png`):
+
+| Regime | Period | n | Trend growth |
+|---|---|---|---|
+| 1 | 1997-08 → 2000-01 | 30 | +5.78 %/yr |
+| 2 | 2000-02 → 2004-09 | 56 | +11.07 %/yr |
+| 3 | 2004-10 → 2007-06 | 33 | +4.23 %/yr |
+| 4 | 2007-07 → 2011-05 | 47 | +9.95 %/yr |
+| 5 | 2011-06 → 2020-03 | 106 | +5.55 %/yr |
+| 6 | 2020-04 → 2026-05 | 74 | +5.18 %/yr |
+
+The 2020-04 break is the COVID cash-hoarding *level* jump (the slope barely changes
+across it); 2011-06 is a genuine growth-rate slowdown.
+
+**Step 2 — forecast.** In log space, because CIC grows multiplicatively:
+
+$$\log \text{EOM}_{t+1} = \log \text{EOM}_t + \hat\mu + \hat\delta_{m(t+1)} - \phi\,(\tilde g_t - \hat\mu)$$
+
+- $\hat\mu$ — drift estimated on the **current regime only** (data after the last
+  break), exponentially weighted with a 12-month half-life, so it never averages
+  across a documented regime shift.
+- $\hat\delta$ — month-of-year effect from the last **36 months** of $\Delta\log$.
+  A deliberately short window: this is the model's main accuracy source, attacking
+  the stale-seasonal problem of §3.3.
+- $\phi = 0.2$ — mean reversion on last month's growth surprise. The sign is right by
+  construction given the documented lag-1 EOM error autocorrelation of **−0.19** (§4).
+
+**Honest attribution — the break detection is *not* why this model wins.** An ablation
+twin ships alongside it (`--models monthly_breaktrend_nobreak`) so this can be
+re-checked at any time:
+
+| Drift specification | Selection | Holdout |
+|---|---|---|
+| breaks + EWMA (shipped) | 30.94 | 31.10 |
+| breaks + plain mean | 31.39 | 30.94 |
+| **no** breaks + EWMA | 30.91 | 31.03 |
+| **no** breaks + plain mean | 31.31 | 30.58 |
+
+All four are within ~0.5 THB bn — turning break detection *off* is, if anything,
+marginally better. The reason is mechanical: the EWMA drift already discounts
+pre-break observations, so the break restriction is redundant on top of it. The real
+gain over the previous winner comes from **log space + the 36-month seasonal window +
+the mean-reversion term**, not from Bai–Perron.
+
+There is also an economic reason breaks buy little *at this horizon*: a 1-month-ahead
+forecast is anchored to the last observed level, so a regime shift only moves the
+forecast through the drift term — about 0.5%/mo ≈ 13 THB bn, of which a ±3pp
+annualised regime change is worth only ~6 THB bn. Seasonal effects are ±2–4%
+≈ 50–100 THB bn. **Seasonal staleness dominates structural change at h=1.**
+
+Breaks are retained because they are individually significant, cost nothing, and bound
+the damage if a genuinely new regime arrives — but they are not sold here as the
+source of the improvement.
+
+### 5.8 `Blend_Baseline_BreakTrend` — the new recommended model ⭐⭐
+Inverse-MSE blend of `Daily_Baseline` and `Monthly_BreakTrend`, same leakage-free
+weighting scheme as §5.6. This is the current winner on both windows (§6). It pairs
+the daily model's within-month calendar shape with the break-trend model's adaptive
+drift and fresh seasonals — the same complementarity argument as §5.6, but with a
+stronger monthly member.
+
+### 5.9 GARCH(1,1) — prediction intervals only
 Fitted on the baseline residuals (ω=2.35, α=0.198, β=0.686, persistence 0.884). It
 does **not** change point forecasts; it supplies time-varying prediction bands and
 flags elevated-risk periods. Given the fat tails in `fig2`, calibrate bands with a
@@ -256,15 +348,40 @@ A model that wins selection but loses holdout would be a red flag (overfitting t
 the tuning period); `Blend_Baseline_Monthly` below wins both, which is the clean
 result you want to see.
 
-**Primary KPI — EOM level RMSE (THB bn), re-run under the §3.5 bug fix** — see
-`fig6_eom_rmse_kpi.png` (bar chart of the same numbers, winner marked):
+**Primary KPI — EOM level RMSE (THB bn).** Charts: `fig6a_daily_models_rmse.png`
+(daily-frequency models) and `fig6b_eom_models_rmse.png` (EOM-frequency models and
+blends). The split matters because the two families reach the same KPI differently —
+daily models forecast ~22 daily ΔCIC values and **sum** them, so within-month errors
+accumulate (§3 finding 1); EOM models forecast the month-end level in **one step**.
+Both are scored on the identical metric.
 
-| Model | Selection 2018–2023 | Holdout 2024–2026 | DM vs baseline (holdout) |
-|---|---|---|---|
-| **`Blend_Baseline_Monthly`** | **30.89** | **33.62** | **−2.59, p=0.015** ✓ |
-| `Monthly_SARIMA` | 37.20 | 34.41 | −1.23, p=0.230 |
-| `Daily_Baseline` (original) | 32.71 | 37.45 | — |
-| `Daily_AdaptiveDrift` | 32.92 | 37.57 | +0.54, p=0.595 |
+| Model | Freq | Selection 2018–2023 | Holdout 2024–2026 | DM vs baseline (holdout) |
+|---|---|---|---|---|
+| **`Blend_Baseline_BreakTrend`** ⭐ | blend | **27.66** | **30.41** | **−2.38, p=0.025** ✓ |
+| `Monthly_BreakTrend_NoBreak` | EOM | 30.91 | 31.03 | −1.35, p=0.190 |
+| `Monthly_BreakTrend` | EOM | 30.94 | 31.10 | −1.34, p=0.193 |
+| `Blend_BreakTrend_Monthly` | blend | 32.41 | 31.84 | −1.50, p=0.144 |
+| `Blend_Baseline_Monthly` (previous winner) | blend | 30.89 | 33.62 | −2.59, p=0.015 ✓ |
+| `Monthly_SARIMA` | EOM | 37.20 | 34.41 | −1.23, p=0.230 |
+| `Daily_Baseline` (original) | daily | 32.71 | 37.45 | — |
+| `Daily_AdaptiveDrift` | daily | 32.92 | 37.57 | +0.54, p=0.595 |
+
+`Blend_Baseline_BreakTrend` wins **both** windows — it is best on selection (27.66)
+*before* the holdout was scored, so the holdout is a confirmation, not a search
+result. Against the original production model it improves holdout RMSE by **18.8%**
+(37.45 → 30.41); against the previous winner by **9.5%** (33.62 → 30.41).
+
+Two caveats stated plainly:
+- **The DM p-value went up, not down** (0.015 → 0.025) even though the new blend is
+  more accurate. That is not a contradiction: DM tests the *error difference series*
+  against `Daily_Baseline`, and the new blend's advantage, while larger on average, is
+  less uniform month-to-month. Both are significant at 5%.
+- **This model was designed after the holdout had already been scored once** for the
+  earlier candidates, so its holdout is a slightly weaker guarantee than the original
+  one-shot. Every tuning decision (seasonal window, half-life, φ) was made by ranking
+  on the **selection** window only — and selection independently picks the same
+  winner — but the number is not quite as clean as a never-seen holdout. Treat 30.41
+  as "very likely better", not as a fresh out-of-sample certificate.
 
 *(`Monthly_UC` 57.79 / 34.77 and `Daily_LevelTrend` 80.55 / 60.78 are carried over
 from the pre-fix run — unlike the four rows above, they have not been re-validated
@@ -272,12 +389,6 @@ under the fixed harness this pass. `Monthly_UC` never consumes the daily exog ma
 so the fix cannot change it; `Daily_LevelTrend` does, its numbers are stale, and
 since it is a rejected model (§5.4) re-running it wasn't worth the compute here —
 re-run before citing it, don't trust the number above.)*
-
-The blend still wins comfortably — **5.6% better than the original in selection,
-10.3% in holdout** — and its holdout margin is now *more* significant (p=0.015 vs.
-the pre-fix run's p=0.043), because `Daily_Baseline` itself moved more than the blend
-did (see below). It won the selection window first, so the holdout is a clean
-confirmation, not a search result.
 
 **Honest surprise from the §3.5 fix.** The phantom-holiday-day bug was hypothesized
 to be free accuracy, worst in Songkran-heavy April. Re-running the four affected
@@ -307,8 +418,10 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 
 ## 7. Production recipe
 
-1. At each month-end, refit `Daily_Baseline` and `Monthly_SARIMA` on all available
+1. At each month-end, refit `Daily_Baseline` and `Monthly_BreakTrend` on all available
    data (seconds each; `cic_forecast.py --eom` caches per-origin forecasts).
+   *(Superseded 2026-08: the pair used to be `Daily_Baseline` + `Monthly_SARIMA`.
+   `Monthly_BreakTrend` replaces `Monthly_SARIMA` as the monthly member — §6.)*
 2. Combine the two EOM forecasts with inverse-MSE weights over the last 12 realised
    EOM errors. **Do not freeze the weights** — the self-correction is the point.
 3. For the daily monitor, take the baseline's daily path and shift it by a constant
@@ -332,10 +445,26 @@ EOM level — so daily shape accuracy is the baseline's by construction.
   29-year history, which contaminates the variance MLE (the same failure mode that
   sank `Daily_AdaptiveDrift`, §5.2). Not yet fixed in this pass — fix before judging
   the model, or a good idea may get rejected for an implementation reason.
+- **Push the seasonal-window finding further.** §5.7's ablation shows the 36-month
+  seasonal window is doing most of the work, and it was tuned coarsely (24/30/36/42/45
+  on the selection window, a flat optimum over 36–42). Worth trying: exponentially
+  discounted seasonal weights instead of a hard cut, and separate window lengths for
+  stable months vs. Songkran/New-Year months.
+- **Re-score the winner on a genuinely fresh holdout** once more data arrives. §6 flags
+  that `Blend_Baseline_BreakTrend` was designed after the holdout had been scored once,
+  so its 30.41 is a slightly weaker guarantee than a never-seen number.
+- **`Monthly_BreakTrend` gives up its COVID intervention.** `Monthly_SARIMA` carries
+  explicit 2020-03/04 dummies; the break model handles COVID only through the 2020-04
+  break plus EWMA discounting. Adding explicit intervention dummies to the break model
+  is untested and may help the 2020 selection-window rows (43.8, its weakest year).
 - A gradient-boosting challenger on calendar + holiday-distance features, evaluated
   on the same backtest with the same selection/holdout discipline.
 - Student-t interval calibration (interval accuracy, not point accuracy).
 - Do **not** revisit the `Daily_LevelTrend` family (§5.4).
+- Do **not** expect more from structural-break detection *at this horizon* — §5.7
+  measured it at ~0 and explains why (h=1 forecasts are anchored to the last observed
+  level, so regime shifts move only the small drift term). It would matter much more
+  at 3–12 month horizons, if the desk ever needs those.
 
 ---
 
@@ -354,7 +483,13 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 | `fig3_garch_volatility.png` | GARCH conditional volatility |
 | `fig4_seasonal_pattern.png` | EOM level by year with next-month forecast fan |
 | `fig5_eom_level_backtest.png` | Actual vs forecast EOM level and errors, all candidates, over time |
-| `fig6_eom_rmse_kpi.png` | **The KPI chart** — EOM level RMSE by model, selection vs. holdout, winner marked. Both fig5 and fig6 are only produced by `--eom` (they compare against `Monthly_SARIMA` and the blend, which only exist in that path) — the plain `python cic_forecast.py` daily pipeline produces fig1–fig4 instead. |
+| `fig6a_daily_models_rmse.png` | **KPI chart, daily-frequency models** — these sum ~22 daily ΔCIC forecasts to reach the month-end level, so within-month errors accumulate |
+| `fig6b_eom_models_rmse.png` | **KPI chart, EOM-frequency models and blends** — these forecast the month-end level in one step; `Daily_Baseline` appears as a dashed reference line (the incumbent to beat) |
+| `fig7_structural_breaks.png` | **Bai–Perron structural breaks** — piecewise trend fit to log CIC with the BIC-selected break dates, plus YoY growth with per-regime means (§5.7) |
+
+fig5, fig6a, fig6b and fig7 are produced only by `--eom` (they involve models that
+exist only on that path); the plain `python cic_forecast.py` daily pipeline produces
+fig1–fig4 instead.
 
 **How to run**
 
@@ -362,8 +497,10 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 pip install -r requirements.txt
 python cic_forecast.py                            # daily pipeline → CIC_output.xlsx (Daily/Monthly EOM/Summary) + fig1-4
 python cic_forecast.py --eom --gate0               # EOM harness: post-fix sanity check only
-python cic_forecast.py --eom                       # EOM harness: full backtest → CIC_output.xlsx (+EOM_* sheets) + fig5 + fig6
-python cic_forecast.py --eom --models baseline,adaptive_drift,monthly_sarima
+python cic_forecast.py --eom                       # EOM harness: full backtest → CIC_output.xlsx (+EOM_* sheets) + fig5/6a/6b/7
+
+# the run behind the §6 table (the winner and its ablation twin):
+python cic_forecast.py --eom --models baseline,adaptive_drift,monthly_sarima,monthly_breaktrend,monthly_breaktrend_nobreak
 ```
 
 ---
