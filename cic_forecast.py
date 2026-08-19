@@ -915,36 +915,6 @@ def plot_data_overview(df, save_dir='.'):
     _save(fig, save_dir, 'fig1_data_overview.png')
 
 
-def plot_residual_diagnostics(residuals_dict, train_label, save_dir='.'):
-    models = list(residuals_dict.keys())
-    n      = len(models)
-    fig, axes = plt.subplots(n, 2, figsize=(14, 4.2 * n))
-    if n == 1:
-        axes = axes[np.newaxis, :]
-    for i, mname in enumerate(models):
-        res  = np.asarray(residuals_dict[mname], float)
-        res  = res[~np.isnan(res)]
-        conf = 1.96 / np.sqrt(len(res))
-        acf_vals = acf(res, nlags=min(40, len(res)//5), fft=True)
-        col  = COLORS.get(mname, 'grey')
-        ax   = axes[i, 0]
-        ax.bar(range(len(acf_vals)), acf_vals, color=col, alpha=0.7)
-        ax.axhline(conf,  color='red', ls='--', lw=0.8)
-        ax.axhline(-conf, color='red', ls='--', lw=0.8)
-        ax.axhline(0, color='black', lw=0.5)
-        ax.set_title(f'{BASE_LABELS.get(mname, mname)}\nResidual ACF', fontsize=10)
-        ax.set_xlabel('Lag')
-        ax = axes[i, 1]
-        (osm, osr), (slope, intercept, _) = stats.probplot(res, dist='norm')
-        ax.scatter(osm, osr, s=6, alpha=0.5, color=col)
-        ax.plot(osm, slope * np.array(osm) + intercept, 'r-', lw=1.5)
-        ax.set_title(f'{BASE_LABELS.get(mname, mname)}\nNormal Q-Q', fontsize=10)
-        ax.set_xlabel('Theoretical quantiles')
-        ax.set_ylabel('Sample quantiles')
-    fig.tight_layout(pad=2)
-    _save(fig, save_dir, 'fig2_residual_diagnostics.png')
-
-
 def plot_garch_volatility(train_index, residuals, garch_res, save_dir='.'):
     fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
     n   = len(residuals)
@@ -970,32 +940,50 @@ def plot_garch_volatility(train_index, residuals, garch_res, save_dir='.'):
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     fig.tight_layout()
-    _save(fig, save_dir, 'fig3_garch_volatility.png')
+    _save(fig, save_dir, 'fig2_garch_volatility.png')
 
 
-def plot_seasonal_pattern(df, fitted_models_dict, hol, save_dir='.'):
+def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
+                          fan_target=None, save_dir='.'):
     """
-    Seasonal CIC pattern: monthly end-of-month CIC level by year.
-    Y-axis  : CIC level (THB billion)
-    X-axis  : Month (Jan–Dec)
-    Lines   : each year (last 10 years highlighted, older years faded)
-    Fan     : 3-model forecast fan — Daily_Baseline / Daily_AdaptiveDrift /
-              Daily_AdaptiveSeasonal — with shaded range across models
+    Seasonal CIC pattern, two panels:
+      left   EOM level by month, one line per year (last 10 years)
+      right  zoom on the forecast month, because the models typically land
+             within ~10 THB bn of each other on a ~2,900 scale and would
+             otherwise overplot into a single dot
+
+    `fan_fc` is {model_key: eom_level} for one target month from
+    future_fan_forecasts(); `fan_roles` labels each as incumbent / best daily /
+    best EOM / best blend. Model keys are the same everywhere (Daily_Baseline,
+    Monthly_BreakTrend, ...) so dots match the RMSE tables and fig5a/5b/5c.
+
+    Only COMPLETE months are drawn. The final month of the sample is usually
+    partial (data stops mid-month), and resampling it to month-end would plot a
+    mid-month level as if it were a month-end — so it is dropped.
     """
     df_lev = df[df['Currency'].notna()].copy()
     eom    = df_lev['Currency'].resample('ME').last().dropna()
 
-    pivot = pd.DataFrame({'month': eom.index.month,
-                          'year':  eom.index.year,
-                          'cic':   eom.values})
-    pivot = pivot.pivot(index='month', columns='year', values='cic')
+    # drop a trailing partial month: its last observation falls short of the
+    # month end by more than a long weekend
+    last_obs = df_lev.index.max()
+    if len(eom) and (eom.index[-1] - last_obs).days > 4:
+        eom = eom.iloc[:-1]
 
+    pivot = pd.DataFrame({'month': eom.index.month, 'year': eom.index.year,
+                          'cic': eom.values}).pivot(index='month', columns='year',
+                                                    values='cic')
     recent_years = sorted([y for y in pivot.columns if y >= pivot.columns.max() - 9])
-    n_yr = len(recent_years)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
-    cmap_colors = cm.tab10(np.linspace(0, 0.9, n_yr))
+    has_fan = bool(fan_fc)
+    if has_fan:
+        fig, (ax, axz) = plt.subplots(
+            1, 2, figsize=(16, 7), gridspec_kw={'width_ratios': [3, 1.15]})
+    else:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        axz = None
 
+    cmap_colors = cm.tab10(np.linspace(0, 0.9, len(recent_years)))
     for i, yr in enumerate(recent_years):
         col_data = pivot.get(yr)
         if col_data is None:
@@ -1003,77 +991,68 @@ def plot_seasonal_pattern(df, fitted_models_dict, hol, save_dir='.'):
         valid = col_data.dropna()
         style = {'lw': 2.0 if yr == recent_years[-1] else 1.2,
                  'alpha': 1.0 if yr >= recent_years[-2] else 0.65}
-        ax.plot(valid.index, valid.values,
-                color=cmap_colors[i], marker='o', ms=4,
+        ax.plot(valid.index, valid.values, color=cmap_colors[i], marker='o', ms=4,
                 label=str(yr), **style)
 
-    # Fan chart: 3 model forecasts shown as lines + shaded range
-    last_date = df_lev.index.max()
-    last_cic  = df_lev['Currency'].iloc[-1]
-    fc_start  = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    fc_end    = (last_date + pd.Timedelta(days=45)).strftime('%Y-%m-%d')
+    if has_fan:
+        mo = fan_target.month
+        vals = list(fan_fc.values())
+        lo, hi = min(vals), max(vals)
+        if len(vals) >= 2:
+            ax.fill_between([mo - 0.3, mo + 0.3], [lo] * 2, [hi] * 2,
+                            color='#cccccc', alpha=0.6, zorder=7)
+        for mname, lvl in fan_fc.items():
+            ax.plot([mo], [lvl], marker='o', ms=8, lw=0, zorder=10,
+                    color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
+                    markeredgecolor='black', markeredgewidth=0.8)
+        ax.annotate(f'{fan_target:%b %Y} fc', xy=(mo, lo),
+                    xytext=(0, -30), textcoords='offset points', ha='center',
+                    fontsize=8.5, fontweight='bold', color='#2b2b28',
+                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
 
-    fan_models = {k: v for k, v in fitted_models_dict.items()
-                  if k in ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')}
-    fan_fc = {}  # mname -> {(yr, mo): eom_level}
+        # ── zoom panel ──
+        order = list(fan_fc)
+        for i, mname in enumerate(order):
+            lvl = fan_fc[mname]
+            role = (fan_roles or {}).get(mname, '')
+            axz.plot([i], [lvl], marker='o', ms=13, lw=0,
+                     color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
+                     markeredgecolor='black', markeredgewidth=0.9, zorder=5)
+            axz.annotate(f'{lvl:,.0f}', xy=(i, lvl), xytext=(0, 14),
+                         textcoords='offset points', ha='center',
+                         fontsize=9.5, fontweight='bold', color='#2b2b28')
+            axz.annotate(role, xy=(i, lvl), xytext=(0, -20),
+                         textcoords='offset points', ha='center',
+                         fontsize=8, color='#4a4a45')
+        span = max(hi - lo, 1.0)
+        axz.set_ylim(lo - span * 1.6, hi + span * 1.6)
+        axz.set_xlim(-0.7, len(order) - 0.3)
+        axz.set_xticks(range(len(order)))
+        axz.set_xticklabels([m.replace('_', '\n') for m in order], fontsize=8.5)
+        axz.set_title(f'Zoom — {fan_target:%b %Y} EOM forecast\n'
+                      f'spread = {hi - lo:,.1f} THB bn', fontsize=10.5,
+                      fontweight='bold')
+        axz.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
+        axz.grid(axis='y', alpha=0.3)
+        axz.spines[['top', 'right']].set_visible(False)
 
-    for mname, mdl in fan_models.items():
-        try:
-            X_fut = generate_future_exog('Daily_Baseline' if mname in ('Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal') else mname,
-                                         fc_start, fc_end, hol)
-            if len(X_fut) == 0:
-                continue
-            fc_change = mdl.forecast(X_fut.values)
-            cic_fc = last_cic
-            eom_fc = {}
-            for dt, chg in zip(X_fut.index, fc_change):
-                cic_fc += chg
-                eom_fc[(dt.year, dt.month)] = cic_fc
-            fan_fc[mname] = eom_fc
-        except Exception as e:
-            print(f'  (Fan forecast skipped for {mname}: {e})')
-
-    if fan_fc:
-        # Shaded range between min/max forecast across models
-        all_keys = set()
-        for eom_fc in fan_fc.values():
-            all_keys.update(eom_fc.keys())
-        for yr_mo in sorted(all_keys):
-            mo = yr_mo[1]
-            vals = [fan_fc[m][yr_mo] for m in fan_models if yr_mo in fan_fc.get(m, {})]
-            if len(vals) >= 2:
-                ax.fill_between([mo - 0.3, mo + 0.3],
-                                [min(vals), min(vals)], [max(vals), max(vals)],
-                                color='#cccccc', alpha=0.5, zorder=7)
-
-        fan_label_map = {k: f'{k} fc' for k in
-                         ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')}
-        for mname in ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal'):
-            eom_fc = fan_fc.get(mname, {})
-            if not eom_fc:
-                continue
-            xs = [k[1] for k in sorted(eom_fc)]
-            ys = [eom_fc[k] for k in sorted(eom_fc)]
-            ax.plot(xs, ys, marker='o', ms=7, lw=0, zorder=10,
-                    color=COLORS.get(mname, 'grey'),
-                    markeredgecolor='black', markeredgewidth=0.8,
-                    label=fan_label_map[mname])
-
-    month_names = ['Jan','Feb','Mar','Apr','May','Jun',
-                   'Jul','Aug','Sep','Oct','Nov','Dec']
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     ax.set_xticks(range(1, 13))
     ax.set_xticklabels(month_names, fontsize=11)
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
-    ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year\n'
-                 '(dots = next-month forecast; shaded band = range across Daily_Baseline / Daily_AdaptiveDrift / Daily_AdaptiveSeasonal)',
+    sub = ''
+    if has_fan:
+        sub = (f'\ndots = 1-month-ahead EOM forecast for {fan_target:%Y-%m} '
+               f'from origin {fan_origin:%Y-%m-%d} (complete months only)')
+    ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year' + sub,
                  fontsize=13, fontweight='bold')
-    ax.legend(fontsize=8.5, ncol=1, loc='upper left',
-              bbox_to_anchor=(1.01, 1), borderaxespad=0,
-              title='Year / Model', title_fontsize=9)
+    ax.legend(fontsize=8.5, ncol=1, loc='upper left', bbox_to_anchor=(1.01, 1),
+              borderaxespad=0, title='Year', title_fontsize=9)
     ax.grid(alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
     fig.tight_layout()
-    _save(fig, save_dir, 'fig4_seasonal_pattern.png')
+    _save(fig, save_dir, 'fig3_seasonal_pattern.png')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1845,21 +1824,15 @@ def run_full_pipeline():
     # cfg_main is the primary config for all figures
     m_data = configs_results['cfg_main']
 
-    # fig2 — Residual ACF/QQ on cfg_main training residuals (motivates GARCH)
-    plot_residual_diagnostics(residuals, m_lbl)
-
-    # fig3 — GARCH conditional volatility (drives prediction intervals)
+    # fig2 — GARCH conditional volatility (drives prediction intervals).
+    # The old residual ACF/Q-Q figure was dropped 2026-08; the same diagnostics
+    # are still reported numerically by run_diagnostics() in step [5] above.
     plot_garch_volatility(m_data['df_train'].index, old_res, garch_res)
 
-    # fig4 — Seasonal EOM pattern by year + next-month forecast fan
-    print('  Generating fig4 (seasonal pattern + model fan chart)...')
-    fan_models_dict = {k: m_fitted[k] for k in
-                       ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal')
-                       if k in m_fitted}
-    plot_seasonal_pattern(df, fan_models_dict, hol)
-
-    # Model-comparison figures live in cic_forecast_v2.py (fig5_eom_level_backtest.png),
-    # which evaluates every candidate on the primary EOM-level KPI.
+    # fig3 (seasonal pattern), fig4 (EOM backtest), fig5a/5b/5c (KPI by family)
+    # and fig6 (structural breaks) are produced by the --eom harness, which is
+    # the only path that has the monthly models, the blends and the backtest
+    # error history those figures compare.
 
     # ── 10. Excel ──
     print('\n[10] Exporting Excel output...')
@@ -2342,6 +2315,17 @@ def model_frequency(key):
     return MODEL_FREQUENCY.get(key, 'eom')
 
 
+# Ablation / diagnostic variants: charted and tabulated like any other model,
+# but never picked as "best of family". They exist to isolate one component of
+# a shipped model (see §5.7), so promoting one to production would be odd even
+# when it edges its parent — and it only ever does so by a noise-sized margin.
+DIAGNOSTIC_ONLY = {'Monthly_BreakTrend_NoBreak'}
+
+
+def is_selectable(key):
+    return key not in DIAGNOSTIC_ONLY
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — EOM BACKTEST HARNESS (expanding window, per-origin cache)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2626,27 +2610,161 @@ def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx'
     print(f'\n  Results exported → {path}  (sheets: EOM_Selection, EOM_Holdout, EOM_Detail, Daily_Guardrail)')
 
 
-def plot_eom(results, keys, path='fig5_eom_level_backtest.png'):
-    fig, axes = plt.subplots(2, 1, figsize=(13, 9), sharex=True)
-    r0 = results[keys[0]]
-    axes[0].plot(r0.index, r0['actual'], 'k-', lw=2, label='Actual EOM level')
-    for k in keys:
+def plot_eom(results, keys=None, path='fig4_eom_level_backtest.png'):
+    """EOM level and error over time for EVERY model in `results` (pass `keys`
+    to restrict). Line colours match fig5a/5b/5c so a model reads the same in
+    every figure."""
+    keys = list(results) if keys is None else [k for k in keys if k in results]
+    if not keys:
+        print('  (fig4 skipped: no results)')
+        return
+    ordered = ([k for k in _KPI_COLOR_ORDER if k in keys]
+               + [k for k in keys if k not in _KPI_COLOR_ORDER])
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9.5), sharex=True)
+    r0 = results[ordered[0]]
+    axes[0].plot(r0.index, r0['actual'], 'k-', lw=2.2, label='Actual EOM level',
+                 zorder=10)
+    for k in ordered:
         r = results[k]
-        axes[0].plot(r.index, r['forecast'], lw=1.2, alpha=0.85, label=k)
-        axes[1].plot(r.index, r['error'], lw=1.2, alpha=0.85, label=k)
+        c  = _KPI_COLORS.get(k, _KPI_FALLBACK)
+        ls = _FREQ_LINESTYLE.get(model_frequency(k), '-')
+        axes[0].plot(r.index, r['forecast'], lw=1.1, alpha=0.85, label=k, color=c, ls=ls)
+        axes[1].plot(r.index, r['error'], lw=1.1, alpha=0.85, label=k, color=c, ls=ls)
     axes[1].axhline(0, color='k', lw=0.8)
-    axes[1].axvline(SELECTION_END, color='grey', ls='--', lw=1)
-    axes[1].text(SELECTION_END, axes[1].get_ylim()[1] * 0.9, ' holdout →',
-                 color='grey', fontsize=9)
-    axes[0].set_title('1-month-ahead end-of-month CIC level — actual vs forecast')
-    axes[1].set_title('EOM forecast error (THB bn)')
     for ax in axes:
-        ax.legend(fontsize=8, ncol=3)
+        ax.axvline(SELECTION_END, color='grey', ls=':', lw=1.4)
+    axes[1].text(SELECTION_END, axes[1].get_ylim()[1] * 0.88, ' holdout →',
+                 color='grey', fontsize=9)
+    axes[0].set_title('1-month-ahead end-of-month CIC level — actual vs forecast\n'
+                      f'{len(ordered)} models — solid = daily, dash-dot = EOM, '
+                      'dashed = blend',
+                      fontsize=12, fontweight='bold')
+    axes[1].set_title('EOM forecast error (THB bn)', fontsize=11)
+    axes[0].legend(fontsize=7.5, ncol=4)
+    axes[1].legend(fontsize=7.5, ncol=4)
+    for ax in axes:
         ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f'  Figure saved → {path}')
+
+
+def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
+    """Genuine next-month EOM forecasts for the fig3 fan, one per family.
+
+    Picks four models by name — `Daily_Baseline` (the incumbent) plus the best
+    daily / best EOM / best blend by holdout RMSE — then refits each on all
+    data up to the last COMPLETE month-end and forecasts the following month.
+    That origin choice keeps every model on the same 1-month-ahead footing the
+    KPI is defined on.
+
+    Daily members go through generate_future_exog() with actual_dates=None, i.e.
+    the true-future path (business days minus the holiday sheet), because the
+    target month's realised trading calendar is not knowable at the origin.
+    The blend reuses the leakage-free inverse-MSE weights of combine_forecasts().
+
+    Returns (fan, origin, target).
+    """
+    lev = df['Currency'].dropna()
+    by_month = lev.groupby(lev.index.to_period('M'))
+    periods = sorted(by_month.groups)
+    # last complete month = one whose last observation is at/after its month-end
+    # minus a few days; simplest robust rule: drop the final (partial) month
+    origin_period = periods[-2] if len(periods) >= 2 else periods[-1]
+    origin = by_month.get_group(origin_period).index[-1]
+    target_period = origin_period + 1
+    target = target_period.to_timestamp('M')
+
+    df_train = df.loc[:origin]
+    last_level = float(df_train['Currency'].dropna().iloc[-1])
+
+    def pick(freq):
+        cand = [m for m in hold_tbl.index
+                if model_frequency(m) == freq and m in results and is_selectable(m)]
+        if not cand:
+            return None
+        return hold_tbl.loc[cand, 'RMSE'].idxmin()
+
+    # role → model. If the best daily model IS the incumbent the two roles
+    # collapse onto one dot; the label then says so rather than inventing a
+    # second daily model just to fill the slot.
+    roles = [('incumbent', 'Daily_Baseline'), ('best daily', pick('daily')),
+             ('best EOM', pick('eom')), ('best blend', pick('blend'))]
+    role_of, chosen = {}, []
+    for role, m in roles:
+        if not m:
+            continue
+        if m in role_of:
+            role_of[m] += f', {role}'
+        else:
+            role_of[m] = role
+            chosen.append(m)
+
+    # map model key → the CLI factory name that builds it
+    key_to_factory = {}
+    for cli_name, factory in MODEL_FACTORY.items():
+        try:
+            key_to_factory.setdefault(factory().key, cli_name)
+        except Exception:
+            continue
+
+    fc_start = target_period.to_timestamp('s').strftime('%Y-%m-%d')
+    fc_end   = target.strftime('%Y-%m-%d')
+    try:
+        X_fut = generate_future_exog('Daily_Baseline', fc_start, fc_end, hol)
+    except Exception as exc:
+        print(f'  (fig3 fan: future exog failed — {exc})')
+        return {}, {}, origin, target
+
+    fan = {}
+    for m in chosen:
+        if model_frequency(m) == 'blend':
+            continue                      # handled below, needs its members
+        cli = key_to_factory.get(m)
+        if cli is None:
+            continue
+        try:
+            out = MODEL_FACTORY[cli]().fit_forecast(
+                df_train, X_fut, last_level, target_period)
+            fan[m] = float(out['eom_fc'])
+        except Exception as exc:
+            print(f'  (fig3 fan: {m} failed — {exc})')
+
+    blend_key = pick('blend')
+    if blend_key:
+        members = [k for k in results
+                   if k != blend_key and f'w_{k}' in results[blend_key].columns]
+        missing = [k for k in members if k not in fan]
+        for k in missing:                 # fit any member not already forecast
+            cli = key_to_factory.get(k)
+            if cli is None:
+                continue
+            try:
+                out = MODEL_FACTORY[cli]().fit_forecast(
+                    df_train, X_fut, last_level, target_period)
+                fan[k] = float(out['eom_fc'])
+            except Exception as exc:
+                print(f'  (fig3 fan: blend member {k} failed — {exc})')
+        if members and all(k in fan for k in members):
+            ws = []
+            for k in members:
+                past = results[k]['error'].tail(window)
+                ws.append(1.0 / max(float((past ** 2).mean()), 1e-9)
+                          if len(past) else np.nan)
+            ws = np.array(ws, float)
+            ws = np.ones(len(members)) if np.isnan(ws).any() else ws
+            ws = ws / ws.sum()
+            ws = np.maximum(ws, floor)
+            ws = ws / ws.sum()
+            fan[blend_key] = float(np.dot(ws, [fan[k] for k in members]))
+        # drop members that were only fitted to build the blend
+        for k in missing:
+            if k not in chosen:
+                fan.pop(k, None)
+
+    return ({m: fan[m] for m in chosen if m in fan},
+            {m: role_of[m] for m in chosen if m in fan}, origin, target)
 
 
 # Fixed categorical order (colorblind-validated: node scripts/validate_palette.js
@@ -2660,41 +2778,49 @@ _KPI_COLOR_ORDER = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeas
                     'Blend_Baseline_Monthly', 'Blend_Baseline_BreakTrend',
                     'Blend_BreakTrend_Monthly', 'Blend_InvMSE_All3', 'Blend_EqualWeight']
 
-# One fixed colour per model, so a model keeps its colour across runs and
-# figures. Colours come from the dataviz skill's validated categorical slots.
-# The daily and EOM panels are separate figures, so the two families may reuse
-# the same slots — what matters is that colours are unique WITHIN a panel.
+# One fixed colour per model, kept stable across runs and figures.  Colours are
+# the dataviz skill's validated categorical slots.  The eight models that
+# normally run together get eight DISTINCT slots, because fig4 draws all of them
+# on one axes — reusing a slot across families would collide there even though
+# it would be fine in the separate fig5a/5b/5c panels.  The rarely-run extras
+# (LevelTrend variants, the 3-way blends) may repeat a slot; fig4 additionally
+# separates the families by linestyle so a repeat stays readable.
 _KPI_COLORS = {
-    # daily-frequency family (fig6a)
+    # daily-frequency family
     'Daily_Baseline':             '#2a78d6',   # blue
     'Daily_AdaptiveDrift':        '#eb6834',   # orange
     'Daily_AdaptiveSeasonal':     '#1baf7a',   # aqua
-    'Daily_LevelTrend':           '#4a3aa7',   # violet
-    'Daily_LevelTrend_LLT':       '#e87ba4',   # magenta
-    'Daily_LevelTrend_NoMask':    '#008300',   # green
-    # EOM-frequency family + blends (fig6b)
+    'Daily_LevelTrend':           '#eda100',   # yellow   (rejected model, rare)
+    'Daily_LevelTrend_LLT':       '#e87ba4',   # magenta  (rare)
+    'Daily_LevelTrend_NoMask':    '#008300',   # green    (rare)
+    # EOM-frequency family
     'Monthly_SARIMA':             '#eda100',   # yellow
     'Monthly_UC':                 '#e87ba4',   # magenta
-    'Monthly_BreakTrend':         '#2a78d6',   # blue
-    'Monthly_BreakTrend_NoBreak': '#eb6834',   # orange
-    # violet/red ordered so orange and red never land adjacent in the panel
-    # (that pair fails the normal-vision separation floor at ΔE 7.1)
-    'Blend_Baseline_Monthly':     '#4a3aa7',   # violet
-    'Blend_Baseline_BreakTrend':  '#1baf7a',   # aqua
-    'Blend_BreakTrend_Monthly':   '#e34948',   # red
-    'Blend_InvMSE_All3':          '#008300',   # green
-    'Blend_EqualWeight':          '#6d6d63',   # neutral
+    'Monthly_BreakTrend':         '#4a3aa7',   # violet
+    'Monthly_BreakTrend_NoBreak': '#008300',   # green
+    # blends — dashed everywhere, so a shared hue still reads distinctly
+    'Blend_Baseline_Monthly':     '#2a78d6',   # blue   (baseline-family blend)
+    'Blend_Baseline_BreakTrend':  '#e34948',   # red    (current winner)
+    'Blend_BreakTrend_Monthly':   '#4a3aa7',   # violet (break-family blend)
+    'Blend_InvMSE_All3':          '#1baf7a',   # aqua
+    'Blend_EqualWeight':          '#eb6834',   # orange
 }
 _KPI_FALLBACK = '#6d6d63'
+
+# fig4 draws every model on one axes; linestyle encodes the family so the
+# figure stays readable even where two models share a hue.
+_FREQ_LINESTYLE = {'daily': '-', 'eom': '-.', 'blend': '--'}
 # kept for plot_structural_breaks(), which colours regimes by position
 _KPI_PALETTE = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
                '#e87ba4', '#4a3aa7', '#e34948', '#008300', '#6d6d63']
 
 
 def _kpi_panel(ax, models, sel_tbl, hold_tbl, ref_key=None):
-    """One grouped selection-vs-holdout RMSE panel. Returns the best model."""
+    """One grouped selection-vs-holdout RMSE panel. Returns the best model
+    (diagnostic-only variants are charted but cannot be 'best')."""
     ranked = hold_tbl.loc[models, 'RMSE'].sort_values().index.tolist()
-    best = ranked[0]
+    sel_ranked = [m for m in ranked if is_selectable(m)] or ranked
+    best = sel_ranked[0]
     colors = {m: _KPI_COLORS.get(m, _KPI_FALLBACK) for m in models}
     sel_rmse  = [sel_tbl.loc[m, 'RMSE']  for m in models]
     hold_rmse = [hold_tbl.loc[m, 'RMSE'] for m in models]
@@ -2739,75 +2865,70 @@ def _kpi_panel(ax, models, sel_tbl, hold_tbl, ref_key=None):
 
 
 def plot_kpi_comparison(sel_tbl, hold_tbl,
-                        path_daily='fig6a_daily_models_rmse.png',
-                        path_eom='fig6b_eom_models_rmse.png'):
-    """Primary-KPI charts, split by model frequency — two separate figures.
+                        path_daily='fig5a_daily_models_rmse.png',
+                        path_eom='fig5b_eom_models_rmse.png',
+                        path_blend='fig5c_blend_models_rmse.png'):
+    """Primary-KPI charts, split by how each model family reaches the KPI.
 
-    fig6a  daily-frequency models: forecast ~22 daily ΔCIC values and SUM them
-           to reach the month-end level, so within-month errors accumulate.
-    fig6b  EOM-frequency models (+ blends): forecast the month-end level in one
-           step, no accumulation. `Daily_Baseline` is drawn as a dashed
-           reference line here because it is the incumbent production model
-           every EOM candidate has to beat.
+    fig5a  daily-frequency models: forecast ~22 daily deltaCIC values and SUM
+           them to the month-end level, so within-month errors accumulate.
+    fig5b  EOM-frequency models: forecast the month-end level in one step.
+    fig5c  blends: inverse-MSE combinations of the two families above. Only
+           drawn when at least one blend is present.
 
-    Both panels score the SAME metric (1-month-ahead EOM level RMSE) so the two
-    figures are directly comparable — the split is about how each family gets
-    to that number, not about scoring them differently.
+    fig5b and fig5c carry a dashed `Daily_Baseline` reference line — it is the
+    incumbent production model every candidate has to beat. All three panels
+    score the SAME metric (1-month-ahead EOM level RMSE), so the figures are
+    directly comparable; the split is about mechanism, not about scoring.
     """
     avail = [m for m in hold_tbl.index if m in sel_tbl.index]
     ordered = ([m for m in _KPI_COLOR_ORDER if m in avail]
                + [m for m in avail if m not in _KPI_COLOR_ORDER])
     daily = [m for m in ordered if model_frequency(m) == 'daily']
-    eom   = [m for m in ordered if model_frequency(m) in ('eom', 'blend')]
+    eom   = [m for m in ordered if model_frequency(m) == 'eom']
+    blend = [m for m in ordered if model_frequency(m) == 'blend']
 
-    best_daily = best_eom = None
-    if daily:
-        fig, ax = plt.subplots(figsize=(max(8, 1.9 * len(daily) + 3), 6.2))
-        best_daily = _kpi_panel(ax, daily, sel_tbl, hold_tbl)
-        ax.set_title('Primary KPI — DAILY-frequency models\n'
-                     'forecast ~22 daily ΔCIC and sum them to the month-end level '
-                     '(errors accumulate)\n'
-                     f'Best daily model: {best_daily} — holdout '
-                     f'{hold_tbl.loc[best_daily, "RMSE"]:.1f}',
+    best = {}
+    panels = [
+        ('daily', daily, path_daily, 'DAILY-frequency models',
+         'forecast ~22 daily \u0394CIC and sum them to the month-end level '
+         '(errors accumulate)', None),
+        ('eom', eom, path_eom, 'EOM-frequency models',
+         'forecast the month-end level directly, in one step '
+         '(no daily accumulation)', 'Daily_Baseline'),
+        ('blend', blend, path_blend, 'BLEND models',
+         'inverse-MSE combinations of a daily and an EOM member, '
+         'reweighted each month from realised errors', 'Daily_Baseline'),
+    ]
+    for fam, models, path, heading, subtitle, ref in panels:
+        if not models:
+            print(f'  ({path} skipped: no {fam}-frequency model in results)')
+            continue
+        fig, ax = plt.subplots(figsize=(max(8, 1.9 * len(models) + 3), 6.2))
+        b = _kpi_panel(ax, models, sel_tbl, hold_tbl, ref_key=ref)
+        best[fam] = b
+        ax.set_title(f'Primary KPI \u2014 {heading}\n{subtitle}\n'
+                     f'Best: {b} \u2014 holdout {hold_tbl.loc[b, "RMSE"]:.1f}',
                      fontsize=12, fontweight='bold')
         ax.legend(loc='upper left', fontsize=8.5, frameon=False)
         fig.tight_layout()
-        fig.savefig(path_daily, dpi=150, bbox_inches='tight')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
-        print(f'  Figure saved → {path_daily}')
-    else:
-        print('  (fig6a skipped: no daily-frequency model in results)')
+        print(f'  Figure saved \u2192 {path}')
 
-    if eom:
-        fig, ax = plt.subplots(figsize=(max(9, 1.9 * len(eom) + 3), 6.2))
-        best_eom = _kpi_panel(ax, eom, sel_tbl, hold_tbl, ref_key='Daily_Baseline')
-        ax.set_title('Primary KPI — EOM-frequency models and blends\n'
-                     'forecast the month-end level directly, in one step '
-                     '(no daily accumulation)\n'
-                     f'Best EOM model: {best_eom} — holdout '
-                     f'{hold_tbl.loc[best_eom, "RMSE"]:.1f}',
-                     fontsize=12, fontweight='bold')
-        ax.legend(loc='upper left', fontsize=8.5, frameon=False)
-        fig.tight_layout()
-        fig.savefig(path_eom, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f'  Figure saved → {path_eom}')
-    else:
-        print('  (fig6b skipped: no EOM-frequency model in results)')
-
-    overall = min([m for m in (best_daily, best_eom) if m],
-                  key=lambda m: hold_tbl.loc[m, 'RMSE'], default=None)
+    for fam, label in (('daily', 'DAILY'), ('eom', 'EOM  '), ('blend', 'BLEND')):
+        if fam in best:
+            print(f'  \u2192 BEST {label} model: {best[fam]} '
+                  f'({hold_tbl.loc[best[fam], "RMSE"]:.2f} holdout)')
+    overall = min(best.values(), key=lambda m: hold_tbl.loc[m, 'RMSE'],
+                  default=None) if best else None
     if overall:
-        print(f'  → BEST DAILY model: {best_daily}'
-              f' ({hold_tbl.loc[best_daily, "RMSE"]:.2f} holdout)' if best_daily else '')
-        print(f'  → BEST EOM   model: {best_eom}'
-              f' ({hold_tbl.loc[best_eom, "RMSE"]:.2f} holdout)' if best_eom else '')
-        print(f'  → BEST OVERALL by holdout EOM RMSE: {overall} '
+        print(f'  \u2192 BEST OVERALL by holdout EOM RMSE: {overall} '
               f'({hold_tbl.loc[overall, "RMSE"]:.2f})')
     return overall
 
 
-def plot_structural_breaks(df, path='fig7_structural_breaks.png',
+def plot_structural_breaks(df, path='fig6_structural_breaks.png',
                            min_size=30, max_breaks=5):
     """Full-sample Bai-Perron diagnostic: where CIC's trend growth changed.
 
@@ -2994,12 +3115,21 @@ def run_eom_harness(args):
     guard_tbl = daily_guardrail(df, daily_store)
 
     export_results(results, sel_tbl, hold_tbl, guard_tbl)
-    plot_eom(results, [k for k in results if k in
-                       ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Monthly_SARIMA',
-                        'Monthly_BreakTrend', 'Daily_LevelTrend',
-                        'Blend_Baseline_Monthly', 'Blend_Baseline_BreakTrend')])
-    plot_kpi_comparison(sel_tbl, hold_tbl)
-    plot_structural_breaks(df)
+
+    # fig3 — seasonal pattern with a genuine next-month forecast per family
+    fan, fan_roles, fan_origin, fan_target = future_fan_forecasts(
+        df, hol, results, hold_tbl)
+    plot_seasonal_pattern(df, fan_fc=fan, fan_roles=fan_roles,
+                          fan_origin=fan_origin, fan_target=fan_target)
+    if fan:
+        print(f'  fig3 fan — 1-month-ahead EOM forecast for {fan_target:%Y-%m} '
+              f'(origin {fan_origin:%Y-%m-%d}):')
+        for m, v in fan.items():
+            print(f'      {m:<28} {v:>10,.1f}   [{fan_roles.get(m, "")}]')
+
+    plot_eom(results)                     # fig4 — every model
+    plot_kpi_comparison(sel_tbl, hold_tbl)   # fig5a / fig5b / fig5c
+    plot_structural_breaks(df)            # fig6
 
 
 # ─────────────────────────────────────────────────────────────────────────────

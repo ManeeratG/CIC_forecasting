@@ -154,7 +154,7 @@ The `<Frequency>` prefix is not cosmetic — it says how the model reaches the K
 - **`Blend_*`** combine already-computed EOM forecasts from both families at the EOM
   level only.
 
-`fig6a` and `fig6b` split the KPI chart along exactly this line.
+`fig5a`, `fig5b` and `fig5c` split the KPI chart along exactly this line.
 
 ### 5.1 `Daily_Baseline` — the 2022 model (benchmark)
 As described in §2. OLS on 55 calendar dummies + ARIMA(1,0,1) on residuals; EOM
@@ -254,7 +254,7 @@ it cheap enough to re-run at every backtest origin.
 the **trend of the level**, which is what the segmented-trend regression above tests.
 There the evidence is overwhelming: $m=0 \to m=1$ gives $F \approx 941$.
 
-BIC selects **m=5 breaks** (see `fig7_structural_breaks.png`):
+BIC selects **m=5 breaks** (see `fig6_structural_breaks.png`):
 
 | Regime | Period | n | Trend growth |
 |---|---|---|---|
@@ -348,12 +348,14 @@ A model that wins selection but loses holdout would be a red flag (overfitting t
 the tuning period); `Blend_Baseline_Monthly` below wins both, which is the clean
 result you want to see.
 
-**Primary KPI — EOM level RMSE (THB bn).** Charts: `fig6a_daily_models_rmse.png`
-(daily-frequency models) and `fig6b_eom_models_rmse.png` (EOM-frequency models and
-blends). The split matters because the two families reach the same KPI differently —
-daily models forecast ~22 daily ΔCIC values and **sum** them, so within-month errors
-accumulate (§3 finding 1); EOM models forecast the month-end level in **one step**.
-Both are scored on the identical metric.
+**Primary KPI — EOM level RMSE (THB bn).** Charts: `fig5a_daily_models_rmse.png`
+(daily-frequency models), `fig5b_eom_models_rmse.png` (EOM-frequency models) and
+`fig5c_blend_models_rmse.png` (blends). The split matters because the three families
+reach the same KPI differently — daily models forecast ~22 daily ΔCIC values and
+**sum** them, so within-month errors accumulate (§3 finding 1); EOM models forecast
+the month-end level in **one step**; blends combine the two. All three are scored on
+the identical metric, and fig5b/fig5c both carry `Daily_Baseline`'s holdout RMSE as a
+dashed reference line (the incumbent every candidate has to beat).
 
 | Model | Freq | Selection 2018–2023 | Holdout 2024–2026 | DM vs baseline (holdout) |
 |---|---|---|---|---|
@@ -473,31 +475,32 @@ EOM level — so daily shape accuracy is the baseline's by construction.
 | File | Purpose |
 |---|---|
 | `cic.prg` | The original EViews program — the specification of record |
-| `cic_forecast.py` | Single-file pipeline (merged 2026-08): data loading, the daily models (`Daily_Baseline` / `Daily_AdaptiveDrift` / `Daily_AdaptiveSeasonal`), GARCH, diagnostics — **and** the EOM-level candidate harness (`Monthly_SARIMA`, `Monthly_UC`, `Daily_LevelTrend`, blends, selection/holdout, DM test, guardrail, `fig6`'s KPI chart), entered via `--eom` |
+| `cic_forecast.py` | Single-file pipeline (merged 2026-08): data loading, the daily models (`Daily_Baseline` / `Daily_AdaptiveDrift` / `Daily_AdaptiveSeasonal`), GARCH — **and** the EOM-level candidate harness (`Monthly_SARIMA`, `Monthly_BreakTrend`, `Monthly_UC`, `Daily_LevelTrend`, blends, selection/holdout, DM test, guardrail, fig3/4/5/6), entered via `--eom` |
 | `input.xlsx` | Source data (`RAW`, `holiday`) |
 | `CIC_output.xlsx` | **The one Excel deliverable.** `Daily` / `Monthly EOM` / `Summary` (from the daily pipeline) plus `EOM_Selection` / `EOM_Holdout` / `EOM_Detail` / `Daily_Guardrail` (from `--eom`) — 7 sheets, one file. Both writers only replace the sheets they own (`_excel_writer()`), so running the daily pipeline and `--eom` in either order accumulates into this one workbook rather than overwriting each other. |
-| `cic_forecast_output.xlsx` | A **separate**, pre-existing internal-diagnostics workbook (per-config eval rows, in-sample fits, rolling/horizon RMSE, GARCH params — 11 sheets aimed at model developers, not the desk). Not touched by the 2026-08 merge; still written by the daily pipeline. Say the word if you want this folded into `CIC_output.xlsx` too — it wasn't merged automatically since its audience (technical) differs from the other two files (production numbers). |
+| `cic_forecast_output.xlsx` | A **separate**, pre-existing internal-diagnostics workbook (per-config eval rows, in-sample fits, rolling/horizon RMSE, GARCH params — 11 sheets aimed at model developers, not the desk). Not touched by the 2026-08 merge; still written by the daily pipeline. Say the word if you want this folded into `CIC_output.xlsx` too. |
 | `R/` | Partial R reproduction of the baseline (EDA and single-window backtest) |
-| `fig1_data_overview.png` | CIC level and daily change, full sample |
-| `fig2_residual_diagnostics.png` | Residual ACF and Q-Q — motivates GARCH and fat tails |
-| `fig3_garch_volatility.png` | GARCH conditional volatility |
-| `fig4_seasonal_pattern.png` | EOM level by year with next-month forecast fan |
-| `fig5_eom_level_backtest.png` | Actual vs forecast EOM level and errors, all candidates, over time |
-| `fig6a_daily_models_rmse.png` | **KPI chart, daily-frequency models** — these sum ~22 daily ΔCIC forecasts to reach the month-end level, so within-month errors accumulate |
-| `fig6b_eom_models_rmse.png` | **KPI chart, EOM-frequency models and blends** — these forecast the month-end level in one step; `Daily_Baseline` appears as a dashed reference line (the incumbent to beat) |
-| `fig7_structural_breaks.png` | **Bai–Perron structural breaks** — piecewise trend fit to log CIC with the BIC-selected break dates, plus YoY growth with per-regime means (§5.7) |
+| `fig1_data_overview.png` | CIC level and daily change, full sample. **daily pipeline.** |
+| `fig2_garch_volatility.png` | GARCH conditional volatility. **daily pipeline.** *(the old residual-ACF/Q-Q figure was dropped 2026-08 — those diagnostics are still printed numerically by `run_diagnostics()`, just not plotted)* |
+| `fig3_seasonal_pattern.png` | EOM level by year, with a genuine next-month forecast dot per family (incumbent / best daily / best EOM / best blend, named by actual model) and a zoom panel on the forecast month. **`--eom`.** |
+| `fig4_eom_level_backtest.png` | Actual vs forecast EOM level and errors over time, **every** model in the run (solid = daily, dash-dot = EOM, dashed = blend). **`--eom`.** |
+| `fig5a_daily_models_rmse.png` | **KPI chart, daily-frequency models** — sum ~22 daily ΔCIC forecasts to reach the month-end level, so within-month errors accumulate. **`--eom`.** |
+| `fig5b_eom_models_rmse.png` | **KPI chart, EOM-frequency models** — forecast the month-end level in one step; `Daily_Baseline` holdout RMSE is a dashed reference line. **`--eom`.** |
+| `fig5c_blend_models_rmse.png` | **KPI chart, blends** — inverse-MSE combinations, same reference line. **`--eom`.** |
+| `fig6_structural_breaks.png` | **Bai–Perron structural breaks** — piecewise trend fit to log CIC with BIC-selected break dates, plus YoY growth with per-regime means (§5.7). **`--eom`.** |
 
-fig5, fig6a, fig6b and fig7 are produced only by `--eom` (they involve models that
-exist only on that path); the plain `python cic_forecast.py` daily pipeline produces
-fig1–fig4 instead.
+fig3–fig6 involve models that only exist on the `--eom` path (Monthly_SARIMA,
+Monthly_BreakTrend, the blends); the plain `python cic_forecast.py` daily pipeline
+produces fig1–fig2 instead. All figures include every model run in that invocation —
+pass `--models` to narrow it.
 
 **How to run**
 
 ```bash
 pip install -r requirements.txt
-python cic_forecast.py                            # daily pipeline → CIC_output.xlsx (Daily/Monthly EOM/Summary) + fig1-4
+python cic_forecast.py                            # daily pipeline → CIC_output.xlsx (Daily/Monthly EOM/Summary) + fig1-2
 python cic_forecast.py --eom --gate0               # EOM harness: post-fix sanity check only
-python cic_forecast.py --eom                       # EOM harness: full backtest → CIC_output.xlsx (+EOM_* sheets) + fig5/6a/6b/7
+python cic_forecast.py --eom                       # EOM harness: full backtest → CIC_output.xlsx (+EOM_* sheets) + fig3-6
 
 # the run behind the §6 table (the winner and its ablation twin):
 python cic_forecast.py --eom --models baseline,adaptive_drift,monthly_sarima,monthly_breaktrend,monthly_breaktrend_nobreak
