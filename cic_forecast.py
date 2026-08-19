@@ -2518,7 +2518,7 @@ def _two_step_monthly_uc(df_train):
     return float(pm[0]), float(pm[1])
 
 
-def _model_two_step(inst, cli, df_train, hol, last_actual_level,
+def _model_two_step(inst, cli, df_train, df_train_daily, hol, last_actual_level,
                     remaining_start, remaining_end, pure_start, pure_end,
                     nowcast_period, pure_period):
     """Nowcast (partial current month) + pure forecast (the next full month),
@@ -2526,11 +2526,14 @@ def _model_two_step(inst, cli, df_train, hol, last_actual_level,
 
     Monthly_SARIMA / Monthly_UC — native multi-step from the fitted
       state-space model; doesn't use last_actual_level as an anchor at all.
+      Uses `df_train` (month-end aligned) — see the two frames' docstring
+      in _forecast_models_two_step.
     Monthly_BreakTrend — anchor-chaining via its own `last_level` argument
       (see its fit_forecast docstring): nowcast anchors on the real partial-
       month level, the pure forecast anchors on the nowcast, with the
       mean-reversion term dropped on the second leg (anchor_ar=False) since
-      there is no new realised surprise to correct against.
+      there is no new realised surprise to correct against. Also uses
+      `df_train` for the same reason as the two models above.
     Everything else (all Daily_* models, which share the contract
       eom_fc = last_level + sum(daily forecasts)) — same anchor-chaining,
       but stepping through actual calendar days: the nowcast sums the
@@ -2538,7 +2541,9 @@ def _model_two_step(inst, cli, df_train, hol, last_actual_level,
       month onto the real last-observed level (the days already realised
       this month are already IN last_actual_level, not re-forecast); the
       pure forecast then sums a full month of forecast days onto the
-      nowcast.
+      nowcast. Uses `df_train_daily` (through the true last actual date) so
+      the ARIMA state is informed by any already-realised days of the
+      current month, matching EViews' `smpl ... 9999`.
 
     Returns (nowcast_val, pure_val, daily_path). `daily_path` is
     (DatetimeIndex, np.ndarray of levels) spanning both legs end-to-end for
@@ -2559,10 +2564,10 @@ def _model_two_step(inst, cli, df_train, hol, last_actual_level,
         return nowcast, pure, None
     # daily-frequency contract
     X_remaining = generate_future_exog('Daily_Baseline', remaining_start, remaining_end, hol)
-    out1 = inst.fit_forecast(df_train, X_remaining, last_actual_level, nowcast_period)
+    out1 = inst.fit_forecast(df_train_daily, X_remaining, last_actual_level, nowcast_period)
     nowcast = out1['eom_fc']
     X_pure = generate_future_exog('Daily_Baseline', pure_start, pure_end, hol)
-    out2 = MODEL_FACTORY[cli]().fit_forecast(df_train, X_pure, nowcast, pure_period)
+    out2 = MODEL_FACTORY[cli]().fit_forecast(df_train_daily, X_pure, nowcast, pure_period)
     pure = out2['eom_fc']
     dates  = X_remaining.index.append(X_pure.index)
     lvl1   = last_actual_level + np.cumsum(np.asarray(out1['daily_fc'], float))
@@ -2615,6 +2620,17 @@ def _forecast_models_two_step(model_keys, df, hol, results, hold_tbl,
 
     origin = lev.loc[:origin_period.to_timestamp('M')].index.max()
     df_train = df.loc[:origin]
+    # Daily_* / LevelTrend models should fit through the true last actual date,
+    # not the previous month-end: EViews' `smpl 4740 9999` runs to the end of
+    # whatever data is loaded, so its estimation (and the AR/MA state it
+    # forecasts from) already sees any partial-month actuals. Stopping at the
+    # prior month-end left those days completely unseen by the model — not even
+    # used to update the ARIMA state — while `last_actual_level` silently
+    # anchored on them, understating the nowcast. Monthly_SARIMA/UC/BreakTrend
+    # must NOT get this frame — they group df_train by calendar month and take
+    # the last value as "the EOM level," so a frame ending mid-month would
+    # corrupt the current month's entry.
+    df_train_daily = df.loc[:last_actual_date]
 
     remaining_start = (last_actual_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
     remaining_end   = nowcast_period.to_timestamp('M').strftime('%Y-%m-%d')
@@ -2638,7 +2654,8 @@ def _forecast_models_two_step(model_keys, df, hol, results, hold_tbl,
             return
         try:
             inst = MODEL_FACTORY[cli]()
-            nc, pf, dp = _model_two_step(inst, cli, df_train, hol, last_actual_level,
+            nc, pf, dp = _model_two_step(inst, cli, df_train, df_train_daily, hol,
+                                         last_actual_level,
                                          remaining_start, remaining_end,
                                          pure_start, pure_end,
                                          nowcast_period, pure_period)
