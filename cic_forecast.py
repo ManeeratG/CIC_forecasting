@@ -943,29 +943,37 @@ def plot_garch_volatility(train_index, residuals, garch_res, save_dir='.'):
     _save(fig, save_dir, 'fig2_garch_volatility.png')
 
 
-def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
-                          fan_target=None, save_dir='.'):
+def plot_seasonal_pattern(df, nowcast_fc=None, pure_fc=None, fan_roles=None,
+                          last_actual_date=None, nowcast_target=None,
+                          pure_target=None, save_dir='.'):
     """
-    Seasonal CIC pattern, two panels:
-      left   EOM level by month, one line per year (last 10 years)
-      right  zoom on the forecast month, because the models typically land
-             within ~10 THB bn of each other on a ~2,900 scale and would
-             otherwise overplot into a single dot
+    Seasonal CIC pattern, three panels:
+      left        EOM level by month, one line per year (last 10 years),
+                  plus two forecast dots per model — a filled circle for the
+                  NOWCAST (this month's expected EOM, combining the real
+                  partial-month level with a forecast for the remaining
+                  days) and an open triangle for the PURE forecast (next
+                  month, no partial-month information at all) — connected by
+                  a thin dotted line per model so the two-step path reads
+                  clearly.
+      middle/right zoom panels on each forecast month separately, because the
+                  models typically land within ~10 THB bn of each other on a
+                  ~2,900 scale and would otherwise overplot into one dot.
 
-    `fan_fc` is {model_key: eom_level} for one target month from
-    future_fan_forecasts(); `fan_roles` labels each as incumbent / best daily /
-    best EOM / best blend. Model keys are the same everywhere (Daily_Baseline,
+    `nowcast_fc` / `pure_fc` are {model_key: eom_level} from
+    future_fan_forecasts(); `fan_roles` labels each as incumbent / best daily
+    / best EOM / best blend. Model keys match everywhere else (Daily_Baseline,
     Monthly_BreakTrend, ...) so dots match the RMSE tables and fig5a/5b/5c.
 
-    Only COMPLETE months are drawn. The final month of the sample is usually
-    partial (data stops mid-month), and resampling it to month-end would plot a
-    mid-month level as if it were a month-end — so it is dropped.
+    History lines only draw COMPLETE months: the final month of the sample is
+    usually partial (data stops mid-month), and resampling it to month-end
+    would plot a mid-month level as if it were a real month-end — so it is
+    dropped from the history lines. Its actual (partial) information still
+    feeds the nowcast dot, just not the history line.
     """
     df_lev = df[df['Currency'].notna()].copy()
     eom    = df_lev['Currency'].resample('ME').last().dropna()
 
-    # drop a trailing partial month: its last observation falls short of the
-    # month end by more than a long weekend
     last_obs = df_lev.index.max()
     if len(eom) and (eom.index[-1] - last_obs).days > 4:
         eom = eom.iloc[:-1]
@@ -975,13 +983,13 @@ def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
                                                     values='cic')
     recent_years = sorted([y for y in pivot.columns if y >= pivot.columns.max() - 9])
 
-    has_fan = bool(fan_fc)
+    has_fan = bool(nowcast_fc) and bool(pure_fc)
     if has_fan:
-        fig, (ax, axz) = plt.subplots(
-            1, 2, figsize=(16, 7), gridspec_kw={'width_ratios': [3, 1.15]})
+        fig, (ax, axz1, axz2) = plt.subplots(
+            1, 3, figsize=(19, 7), gridspec_kw={'width_ratios': [3, 1.05, 1.05]})
     else:
         fig, ax = plt.subplots(figsize=(14, 7))
-        axz = None
+        axz1 = axz2 = None
 
     cmap_colors = cm.tab10(np.linspace(0, 0.9, len(recent_years)))
     for i, yr in enumerate(recent_years):
@@ -994,28 +1002,14 @@ def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
         ax.plot(valid.index, valid.values, color=cmap_colors[i], marker='o', ms=4,
                 label=str(yr), **style)
 
-    if has_fan:
-        mo = fan_target.month
-        vals = list(fan_fc.values())
+    def _zoom(axz, fc, target, marker, title_prefix):
+        order = list(fc)
+        vals = list(fc.values())
         lo, hi = min(vals), max(vals)
-        if len(vals) >= 2:
-            ax.fill_between([mo - 0.3, mo + 0.3], [lo] * 2, [hi] * 2,
-                            color='#cccccc', alpha=0.6, zorder=7)
-        for mname, lvl in fan_fc.items():
-            ax.plot([mo], [lvl], marker='o', ms=8, lw=0, zorder=10,
-                    color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
-                    markeredgecolor='black', markeredgewidth=0.8)
-        ax.annotate(f'{fan_target:%b %Y} fc', xy=(mo, lo),
-                    xytext=(0, -30), textcoords='offset points', ha='center',
-                    fontsize=8.5, fontweight='bold', color='#2b2b28',
-                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
-
-        # ── zoom panel ──
-        order = list(fan_fc)
         for i, mname in enumerate(order):
-            lvl = fan_fc[mname]
+            lvl = fc[mname]
             role = (fan_roles or {}).get(mname, '')
-            axz.plot([i], [lvl], marker='o', ms=13, lw=0,
+            axz.plot([i], [lvl], marker=marker, ms=13, lw=0,
                      color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
                      markeredgecolor='black', markeredgewidth=0.9, zorder=5)
             axz.annotate(f'{lvl:,.0f}', xy=(i, lvl), xytext=(0, 14),
@@ -1029,12 +1023,43 @@ def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
         axz.set_xlim(-0.7, len(order) - 0.3)
         axz.set_xticks(range(len(order)))
         axz.set_xticklabels([m.replace('_', '\n') for m in order], fontsize=8.5)
-        axz.set_title(f'Zoom — {fan_target:%b %Y} EOM forecast\n'
-                      f'spread = {hi - lo:,.1f} THB bn', fontsize=10.5,
-                      fontweight='bold')
+        axz.set_title(f'{title_prefix} — {target:%b %Y}\nspread = {hi - lo:,.1f} THB bn',
+                     fontsize=10.5, fontweight='bold')
         axz.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
         axz.grid(axis='y', alpha=0.3)
         axz.spines[['top', 'right']].set_visible(False)
+        return lo, hi
+
+    if has_fan:
+        mo_now, mo_pure = nowcast_target.month, pure_target.month
+        for mname in nowcast_fc:
+            if mname not in pure_fc:
+                continue
+            c = _KPI_COLORS.get(mname, _KPI_FALLBACK)
+            ax.plot([mo_now, mo_pure], [nowcast_fc[mname], pure_fc[mname]],
+                    ls=':', lw=1.1, color=c, zorder=6, alpha=0.8)
+        for fc, mo, marker in ((nowcast_fc, mo_now, 'o'), (pure_fc, mo_pure, '^')):
+            vals = list(fc.values())
+            if len(vals) >= 2:
+                ax.fill_between([mo - 0.3, mo + 0.3], [min(vals)] * 2, [max(vals)] * 2,
+                                color='#cccccc', alpha=0.5, zorder=5)
+            for mname, lvl in fc.items():
+                ax.plot([mo], [lvl], marker=marker, ms=9 if marker == 'o' else 10,
+                        lw=0, zorder=10, color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
+                        markeredgecolor='black', markeredgewidth=0.8)
+        ax.annotate(f'{nowcast_target:%b %Y}\nnowcast', xy=(mo_now, min(nowcast_fc.values())),
+                    xytext=(-8, -34), textcoords='offset points', ha='center',
+                    fontsize=8.5, fontweight='bold', color='#2b2b28',
+                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
+        ax.annotate(f'{pure_target:%b %Y}\npure forecast', xy=(mo_pure, max(pure_fc.values())),
+                    xytext=(8, 30), textcoords='offset points', ha='center',
+                    fontsize=8.5, fontweight='bold', color='#2b2b28',
+                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
+
+        _zoom(axz1, nowcast_fc, nowcast_target, 'o',
+             'Zoom — nowcast\n(partial month + forecast remainder)')
+        _zoom(axz2, pure_fc, pure_target, '^',
+             'Zoom — pure forecast\n(no partial-month data)')
 
     month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -1043,15 +1068,20 @@ def plot_seasonal_pattern(df, fan_fc=None, fan_roles=None, fan_origin=None,
     ax.set_ylabel('CIC Level (THB billion)', fontsize=11)
     sub = ''
     if has_fan:
-        sub = (f'\ndots = 1-month-ahead EOM forecast for {fan_target:%Y-%m} '
-               f'from origin {fan_origin:%Y-%m-%d} (complete months only)')
+        sub = f'\n\u25cf nowcast {nowcast_target:%b %Y}   \u25b3 pure forecast {pure_target:%b %Y}'
     ax.set_title('Seasonal CIC Pattern — End-of-Month Level by Year' + sub,
                  fontsize=13, fontweight='bold')
     ax.legend(fontsize=8.5, ncol=1, loc='upper left', bbox_to_anchor=(1.01, 1),
               borderaxespad=0, title='Year', title_fontsize=9)
     ax.grid(alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
-    fig.tight_layout()
+    if has_fan:
+        fig.text(0.01, 0.005,
+                 f'\u25cf nowcast = real data through {last_actual_date:%Y-%m-%d} '
+                 f'+ forecast for the rest of {nowcast_target:%B}.   '
+                 f'\u25b3 pure forecast = {pure_target:%B}, no partial-month data at all.',
+                 fontsize=8.5, color='#4a4a45')
+    fig.tight_layout(rect=[0, 0.025, 1, 1])
     _save(fig, save_dir, 'fig3_seasonal_pattern.png')
 
 
@@ -2185,7 +2215,21 @@ class MonthlyBreakTrendModel:
         if key:
             self.key = key
 
-    def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
+    def fit_forecast(self, df_train, X_fut_df, last_level, target_month,
+                     anchor_ar=True):
+        """`last_level` is the anchor level (THB) the forecast steps off. In
+        the standard 1-month-ahead call it always equals df_train's own last
+        observed EOM level (the two are numerically identical there, since
+        df_train ends at the origin month-end) — but it can be overridden
+        with a NOWCAST to chain a second, genuinely-out-of-sample month off
+        it (see future_fan_forecasts(), fig3's 'pure forecast' dot).
+
+        `anchor_ar`: the mean-reversion term corrects a REALISED month's
+        growth surprise. Set False when chaining a second step off a nowcast
+        — there is no new realised surprise to correct against, so
+        reapplying the same historical one would misrepresent the forecast
+        as using information it doesn't have.
+        """
         eom    = _monthly_eom_series(df_train).astype(float)
         logeom = np.log(eom)
         yd     = _deseasonalise_log(logeom)
@@ -2210,8 +2254,8 @@ class MonthlyBreakTrendModel:
         sg = sg - sg.mean()
         seas = float(sg.get(target_month.month, 0.0))
 
-        fc_log = float(logeom.iloc[-1]) + drift + seas
-        if self.ar_adj:
+        fc_log = np.log(last_level) + drift + seas
+        if self.ar_adj and anchor_ar:
             fc_log -= self.ar_adj * float(gd.iloc[-1] - drift)
         return {'eom_fc': float(np.exp(fc_log)), 'daily_fc': None}
 
@@ -2592,10 +2636,40 @@ def reconciled_daily_path(daily_store, base_key, base_eom, target_eom, target):
     return base + shift
 
 
-def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx'):
+def top_models_for_export(hold_tbl, n=3, always_include=('Daily_Baseline',)):
+    """Top `n` selectable models by holdout RMSE (the number that decides the
+    winner, §6), plus `always_include` if not already in that set — keeps the
+    production workbook to the models someone would actually consider, always
+    with the incumbent for reference, rather than every research variant the
+    harness happened to run. Ablation-only variants never take a slot
+    (is_selectable()); a diagnostic that scores well is still not a candidate.
+    """
+    ranked = [m for m in hold_tbl.sort_values('RMSE').index if is_selectable(m)]
+    keep = ranked[:n]
+    for m in always_include:
+        if m in hold_tbl.index and m not in keep:
+            keep.append(m)
+    return keep
+
+
+def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx',
+                   keep=None):
     """Writes EOM_Selection / EOM_Holdout / EOM_Detail / Daily_Guardrail into the
     single consolidated workbook (see _excel_writer) — append-safe, so this never
-    wipes the Daily / Monthly EOM / Summary sheets from the daily pipeline."""
+    wipes the Daily / Monthly EOM / Summary sheets from the daily pipeline.
+
+    `keep` restricts every sheet to that set of model keys (see
+    top_models_for_export()); None writes every model in `results`, which is
+    what the harness's OWN diagnostics (fig4, fig5a/b/c) still see regardless —
+    only the Excel export is narrowed, so nothing is lost, just not dumped into
+    the workbook a production user opens.
+    """
+    if keep is not None:
+        sel_tbl  = sel_tbl.loc[[m for m in sel_tbl.index if m in keep]]
+        hold_tbl = hold_tbl.loc[[m for m in hold_tbl.index if m in keep]]
+        results  = {k: v for k, v in results.items() if k in keep}
+        if guard_tbl is not None:
+            guard_tbl = guard_tbl.loc[[m for m in guard_tbl.index if m in keep]]
     with _excel_writer(path) as xw:
         sel_tbl.round(3).to_excel(xw, sheet_name='EOM_Selection')
         hold_tbl.round(3).to_excel(xw, sheet_name='EOM_Holdout')
@@ -2605,9 +2679,12 @@ def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx'
             d.insert(0, 'Model', k)
             detail.append(d)
         pd.concat(detail).round(3).to_excel(xw, sheet_name='EOM_Detail', index=False)
-        if guard_tbl is not None:
+        if guard_tbl is not None and len(guard_tbl):
             guard_tbl.round(3).to_excel(xw, sheet_name='Daily_Guardrail')
-    print(f'\n  Results exported → {path}  (sheets: EOM_Selection, EOM_Holdout, EOM_Detail, Daily_Guardrail)')
+    kept_str = ', '.join(hold_tbl.index) if keep is not None else 'all models'
+    print(f'\n  Results exported → {path}  '
+         f'(sheets: EOM_Selection, EOM_Holdout, EOM_Detail, Daily_Guardrail; '
+         f'models: {kept_str})')
 
 
 def plot_eom(results, keys=None, path='fig4_eom_level_backtest.png'):
@@ -2650,34 +2727,124 @@ def plot_eom(results, keys=None, path='fig4_eom_level_backtest.png'):
     print(f'  Figure saved → {path}')
 
 
+def _two_step_monthly_sarima(df_train):
+    """Native 2-step SARIMAX forecast — bypasses the anchor-chaining trick
+    used for the other model families since SARIMAX already forecasts
+    multiple steps coherently from its own state."""
+    eom = _monthly_eom_series(df_train)
+    exog = pd.DataFrame(index=eom.index)
+    exog['covid_mar20'] = (eom.index.to_period('M') == pd.Period('2020-03')).astype(float)
+    exog['covid_apr20'] = (eom.index.to_period('M') == pd.Period('2020-04')).astype(float)
+    mdl = SARIMAX(eom, exog=exog, order=(1, 1, 1), seasonal_order=(0, 1, 1, 12),
+                 enforce_stationarity=False, enforce_invertibility=False
+                 ).fit(disp=False, maxiter=300)
+    exog_f = pd.DataFrame({'covid_mar20': [0.0, 0.0], 'covid_apr20': [0.0, 0.0]})
+    fc = mdl.forecast(steps=2, exog=exog_f)
+    return float(fc.iloc[0]), float(fc.iloc[1])
+
+
+def _two_step_monthly_uc(df_train):
+    """Native 2-step UC forecast, same reasoning as _two_step_monthly_sarima."""
+    eom = _monthly_eom_series(df_train).astype(float)
+    masked = eom.copy()
+    masked[(masked.index >= COVID_START) & (masked.index <= COVID_END)] = np.nan
+    mdl = UnobservedComponents(masked, level='local linear trend', seasonal=12
+                               ).fit(disp=False, method='bfgs', maxiter=300)
+    pm = np.asarray(mdl.get_forecast(steps=2).predicted_mean)
+    return float(pm[0]), float(pm[1])
+
+
+def _model_two_step(inst, cli, df_train, hol, last_actual_level,
+                    remaining_start, remaining_end, pure_start, pure_end,
+                    nowcast_period, pure_period):
+    """Nowcast (partial current month) + pure forecast (the next full month),
+    for one model instance. Three cases:
+
+    Monthly_SARIMA / Monthly_UC — native multi-step from the fitted
+      state-space model; doesn't use last_actual_level as an anchor at all.
+    Monthly_BreakTrend — anchor-chaining via its own `last_level` argument
+      (see its fit_forecast docstring): nowcast anchors on the real partial-
+      month level, the pure forecast anchors on the nowcast, with the
+      mean-reversion term dropped on the second leg (anchor_ar=False) since
+      there is no new realised surprise to correct against.
+    Everything else (all Daily_* models, which share the contract
+      eom_fc = last_level + sum(daily forecasts)) — same anchor-chaining,
+      but stepping through actual calendar days: the nowcast sums the
+      model's forecast for only the REMAINING trading days of the partial
+      month onto the real last-observed level (the days already realised
+      this month are already IN last_actual_level, not re-forecast); the
+      pure forecast then sums a full month of forecast days onto the
+      nowcast.
+    """
+    if isinstance(inst, MonthlySarimaModel):
+        return _two_step_monthly_sarima(df_train)
+    if isinstance(inst, MonthlyUCModel):
+        return _two_step_monthly_uc(df_train)
+    if isinstance(inst, MonthlyBreakTrendModel):
+        nowcast = inst.fit_forecast(df_train, None, last_actual_level,
+                                    nowcast_period)['eom_fc']
+        pure = MODEL_FACTORY[cli]().fit_forecast(
+            df_train, None, nowcast, pure_period, anchor_ar=False)['eom_fc']
+        return nowcast, pure
+    # daily-frequency contract
+    X_remaining = generate_future_exog('Daily_Baseline', remaining_start, remaining_end, hol)
+    nowcast = inst.fit_forecast(df_train, X_remaining, last_actual_level,
+                                nowcast_period)['eom_fc']
+    X_pure = generate_future_exog('Daily_Baseline', pure_start, pure_end, hol)
+    pure = MODEL_FACTORY[cli]().fit_forecast(
+        df_train, X_pure, nowcast, pure_period)['eom_fc']
+    return nowcast, pure
+
+
 def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
-    """Genuine next-month EOM forecasts for the fig3 fan, one per family.
+    """Genuine forecasts for the fig3 fan, one per family, at TWO horizons:
 
-    Picks four models by name — `Daily_Baseline` (the incumbent) plus the best
-    daily / best EOM / best blend by holdout RMSE — then refits each on all
-    data up to the last COMPLETE month-end and forecasts the following month.
-    That origin choice keeps every model on the same 1-month-ahead footing the
-    KPI is defined on.
+      nowcast        the CURRENT month's expected EOM level. If the data has
+                      a trailing partial month (the usual case — input.xlsx
+                      always lags a few days), this combines the real
+                      partial-month level with a forecast for only the
+                      REMAINING days; if data happens to end exactly at a
+                      month boundary it reduces to an ordinary 1-step
+                      forecast, same code path either way.
+      pure forecast   the FOLLOWING month's EOM level, with no partial-month
+                      information at all — a genuine 2-month-ahead forecast,
+                      chained off the nowcast (or off SARIMAX/UC's own
+                      2-step state for those two families).
 
-    Daily members go through generate_future_exog() with actual_dates=None, i.e.
-    the true-future path (business days minus the holiday sheet), because the
-    target month's realised trading calendar is not knowable at the origin.
-    The blend reuses the leakage-free inverse-MSE weights of combine_forecasts().
+    Both horizons are fit on data up to the last COMPLETE month only — the
+    partial month's actuals are used as an anchor LEVEL, never fed back into
+    re-estimating any model's parameters (drift, seasonal betas, ARIMA
+    coefficients, ...), matching the 1-month-ahead protocol the KPI is
+    defined on.
 
-    Returns (fan, origin, target).
+    Picks four models by name — `Daily_Baseline` (the incumbent) plus the
+    best daily / best EOM / best blend by holdout RMSE (diagnostic-only
+    ablation variants excluded, see is_selectable()). The blend reuses the
+    leakage-free inverse-MSE weights of combine_forecasts() at BOTH horizons.
+
+    Returns (nowcast_fan, pure_fan, roles, last_actual_date, origin,
+    nowcast_target, pure_target).
     """
     lev = df['Currency'].dropna()
-    by_month = lev.groupby(lev.index.to_period('M'))
-    periods = sorted(by_month.groups)
-    # last complete month = one whose last observation is at/after its month-end
-    # minus a few days; simplest robust rule: drop the final (partial) month
-    origin_period = periods[-2] if len(periods) >= 2 else periods[-1]
-    origin = by_month.get_group(origin_period).index[-1]
-    target_period = origin_period + 1
-    target = target_period.to_timestamp('M')
+    last_actual_date  = lev.index.max()
+    last_actual_level = float(lev.iloc[-1])
+    cur_period     = last_actual_date.to_period('M')
+    cur_period_end = cur_period.to_timestamp('M')
+    is_partial = (cur_period_end - last_actual_date).days > 4
 
+    if is_partial:
+        origin_period, nowcast_period = cur_period - 1, cur_period
+    else:
+        origin_period, nowcast_period = cur_period, cur_period + 1
+    pure_period = nowcast_period + 1
+
+    origin = lev.loc[:origin_period.to_timestamp('M')].index.max()
     df_train = df.loc[:origin]
-    last_level = float(df_train['Currency'].dropna().iloc[-1])
+
+    remaining_start = (last_actual_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    remaining_end   = nowcast_period.to_timestamp('M').strftime('%Y-%m-%d')
+    pure_start      = (nowcast_period.to_timestamp('M') + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    pure_end        = pure_period.to_timestamp('M').strftime('%Y-%m-%d')
 
     def pick(freq):
         cand = [m for m in hold_tbl.index
@@ -2701,7 +2868,6 @@ def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
             role_of[m] = role
             chosen.append(m)
 
-    # map model key → the CLI factory name that builds it
     key_to_factory = {}
     for cli_name, factory in MODEL_FACTORY.items():
         try:
@@ -2709,44 +2875,36 @@ def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
         except Exception:
             continue
 
-    fc_start = target_period.to_timestamp('s').strftime('%Y-%m-%d')
-    fc_end   = target.strftime('%Y-%m-%d')
-    try:
-        X_fut = generate_future_exog('Daily_Baseline', fc_start, fc_end, hol)
-    except Exception as exc:
-        print(f'  (fig3 fan: future exog failed — {exc})')
-        return {}, {}, origin, target
+    nowcast_fan, pure_fan = {}, {}
 
-    fan = {}
-    for m in chosen:
-        if model_frequency(m) == 'blend':
-            continue                      # handled below, needs its members
+    def forecast_one(m):
+        if m in nowcast_fan:
+            return
         cli = key_to_factory.get(m)
         if cli is None:
-            continue
+            return
         try:
-            out = MODEL_FACTORY[cli]().fit_forecast(
-                df_train, X_fut, last_level, target_period)
-            fan[m] = float(out['eom_fc'])
+            inst = MODEL_FACTORY[cli]()
+            nc, pf = _model_two_step(inst, cli, df_train, hol, last_actual_level,
+                                     remaining_start, remaining_end,
+                                     pure_start, pure_end,
+                                     nowcast_period, pure_period)
+            nowcast_fan[m] = float(nc)
+            pure_fan[m]    = float(pf)
         except Exception as exc:
             print(f'  (fig3 fan: {m} failed — {exc})')
+
+    for m in chosen:
+        if model_frequency(m) != 'blend':
+            forecast_one(m)
 
     blend_key = pick('blend')
     if blend_key:
         members = [k for k in results
                    if k != blend_key and f'w_{k}' in results[blend_key].columns]
-        missing = [k for k in members if k not in fan]
-        for k in missing:                 # fit any member not already forecast
-            cli = key_to_factory.get(k)
-            if cli is None:
-                continue
-            try:
-                out = MODEL_FACTORY[cli]().fit_forecast(
-                    df_train, X_fut, last_level, target_period)
-                fan[k] = float(out['eom_fc'])
-            except Exception as exc:
-                print(f'  (fig3 fan: blend member {k} failed — {exc})')
-        if members and all(k in fan for k in members):
+        for k in members:
+            forecast_one(k)
+        if members and all(k in nowcast_fan for k in members):
             ws = []
             for k in members:
                 past = results[k]['error'].tail(window)
@@ -2757,14 +2915,17 @@ def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
             ws = ws / ws.sum()
             ws = np.maximum(ws, floor)
             ws = ws / ws.sum()
-            fan[blend_key] = float(np.dot(ws, [fan[k] for k in members]))
-        # drop members that were only fitted to build the blend
-        for k in missing:
+            nowcast_fan[blend_key] = float(np.dot(ws, [nowcast_fan[k] for k in members]))
+            pure_fan[blend_key]    = float(np.dot(ws, [pure_fan[k] for k in members]))
+        for k in members:                 # drop members only fitted to build the blend
             if k not in chosen:
-                fan.pop(k, None)
+                nowcast_fan.pop(k, None)
+                pure_fan.pop(k, None)
 
-    return ({m: fan[m] for m in chosen if m in fan},
-            {m: role_of[m] for m in chosen if m in fan}, origin, target)
+    keep = [m for m in chosen if m in nowcast_fan and m in pure_fan]
+    return ({m: nowcast_fan[m] for m in keep}, {m: pure_fan[m] for m in keep},
+            {m: role_of[m] for m in keep}, last_actual_date,
+            origin, nowcast_period.to_timestamp('M'), pure_period.to_timestamp('M'))
 
 
 # Fixed categorical order (colorblind-validated: node scripts/validate_palette.js
@@ -3114,18 +3275,27 @@ def run_eom_harness(args):
 
     guard_tbl = daily_guardrail(df, daily_store)
 
-    export_results(results, sel_tbl, hold_tbl, guard_tbl)
+    # CIC_output.xlsx gets only the models a production user would weigh:
+    # the top 3 by holdout RMSE, plus Daily_Baseline (the incumbent) if it
+    # didn't already make the cut. fig4/fig5a/b/c below still show everything
+    # that was run — only the Excel export is narrowed.
+    export_keep = top_models_for_export(hold_tbl)
+    export_results(results, sel_tbl, hold_tbl, guard_tbl, keep=export_keep)
 
-    # fig3 — seasonal pattern with a genuine next-month forecast per family
-    fan, fan_roles, fan_origin, fan_target = future_fan_forecasts(
-        df, hol, results, hold_tbl)
-    plot_seasonal_pattern(df, fan_fc=fan, fan_roles=fan_roles,
-                          fan_origin=fan_origin, fan_target=fan_target)
-    if fan:
-        print(f'  fig3 fan — 1-month-ahead EOM forecast for {fan_target:%Y-%m} '
-              f'(origin {fan_origin:%Y-%m-%d}):')
-        for m, v in fan.items():
-            print(f'      {m:<28} {v:>10,.1f}   [{fan_roles.get(m, "")}]')
+    # fig3 — seasonal pattern with a nowcast (partial month) + pure forecast
+    # (next full month) per family
+    (nowcast_fc, pure_fc, fan_roles, last_actual_date, fan_origin,
+     nowcast_target, pure_target) = future_fan_forecasts(df, hol, results, hold_tbl)
+    plot_seasonal_pattern(df, nowcast_fc=nowcast_fc, pure_fc=pure_fc,
+                          fan_roles=fan_roles, last_actual_date=last_actual_date,
+                          nowcast_target=nowcast_target, pure_target=pure_target)
+    if nowcast_fc:
+        print(f'  fig3 fan — nowcast {nowcast_target:%Y-%m} (real data through '
+              f'{last_actual_date:%Y-%m-%d}) / pure forecast {pure_target:%Y-%m} '
+              f'(model fit cutoff {fan_origin:%Y-%m-%d}):')
+        for m in nowcast_fc:
+            print(f'      {m:<28} nowcast {nowcast_fc[m]:>10,.1f}   '
+                  f'pure {pure_fc[m]:>10,.1f}   [{fan_roles.get(m, "")}]')
 
     plot_eom(results)                     # fig4 — every model
     plot_kpi_comparison(sel_tbl, hold_tbl)   # fig5a / fig5b / fig5c
