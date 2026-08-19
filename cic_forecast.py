@@ -76,7 +76,18 @@ from statsmodels.tsa.stattools import adfuller, acf
 from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 from arch import arch_model
+
+# statsmodels registers its OWN 'always' filter for ConvergenceWarning at
+# import time, positioned ahead of whatever the caller set up before the
+# import — so the blanket filterwarnings('ignore') above does not actually
+# suppress it (verified: it's the first-matching filter regardless of import
+# order). Re-filtering here, after the import, puts ours back in front.
+# ~100-origin backtests fit dozens of state-space/ARIMA MLEs per run and
+# occasional non-convergence on a few origins is normal, not a sign the
+# forecast is wrong — statsmodels still returns its best iterate either way.
+warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
 np.random.seed(42)
 
