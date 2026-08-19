@@ -2069,6 +2069,180 @@ class MonthlySarimaModel:
         return {'eom_fc': fc, 'daily_fc': None}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STRUCTURAL BREAKS — Bai-Perron (1998) on a segmented trend in log CIC
+# ─────────────────────────────────────────────────────────────────────────────
+# Why a segmented TREND and not a mean shift: a mean-shift test on monthly
+# growth finds nothing (growth sd 2.6%/mo vs mean 0.6%/mo — any drift shift is
+# swamped by noise; BIC picks m=0). CIC regime change shows up as a change in
+# the TREND GROWTH RATE of the level, which is what the segmented-trend
+# regression below tests. On the full sample that test is overwhelming
+# (m=0 → m=1 gives F≈941), so the breaks are real, not a fitting artefact.
+
+def _seg_ssr_trend(y):
+    """ssr[i, j] = SSR of OLS of y[i:j+1] on [1, t], for every (i, j).
+
+    Closed form from cumulative sums so the whole matrix costs O(n²) rather
+    than O(n³) — this runs at every backtest origin, so it has to be cheap.
+    """
+    n = len(y)
+    t   = np.arange(n, dtype=float)
+    cy  = np.concatenate([[0.0], np.cumsum(y)])
+    cyy = np.concatenate([[0.0], np.cumsum(y * y)])
+    cty = np.concatenate([[0.0], np.cumsum(t * y)])
+    ssr = np.full((n, n), np.inf)
+    for i in range(n):
+        j   = np.arange(i, n)
+        m   = (j - i + 1).astype(float)
+        Sy  = cy[j + 1] - cy[i]
+        Syy = cyy[j + 1] - cyy[i]
+        Sty = (cty[j + 1] - cty[i]) - i * Sy      # recentre to local t' = t - i
+        St  = m * (m - 1) / 2
+        St2 = (m - 1) * m * (2 * m - 1) / 6
+        Sxx = St2 - St ** 2 / m
+        Sxy = Sty - St * Sy / m
+        Syyc = Syy - Sy ** 2 / m
+        with np.errstate(divide='ignore', invalid='ignore'):
+            s = np.where(Sxx > 1e-12, Syyc - Sxy ** 2 / Sxx, np.inf)
+        ssr[i, i:] = np.maximum(s, 0.0)
+    return ssr
+
+
+def bai_perron_breaks(y, max_breaks=5, min_size=30, crit='bic'):
+    """Bai-Perron multiple-break estimation by dynamic programming.
+
+    Globally minimises total SSR of a piecewise [1, t] regression for each
+    number of breaks m, then selects m by BIC (or LWZ, the stricter
+    Liu-Wu-Zivot criterion). `min_size` is the minimum segment length in
+    months, which is also the trimming parameter.
+
+    Returns (break_indices, info_dict). Break index b means a new regime
+    starts at observation b.
+    """
+    n = len(y)
+    if n < 2 * min_size:
+        return [], {'m': 0, 'table': []}
+    ssr = _seg_ssr_trend(y)
+    best_by_m = {0: ([], ssr[0, n - 1])}
+    prev_ssr = ssr[0, :].copy()
+    prev_bk  = [[] for _ in range(n)]
+    for m in range(1, max_breaks + 1):
+        cur_ssr = np.full(n, np.inf)
+        cur_bk  = [[] for _ in range(n)]
+        lo = m * min_size
+        for j in range(lo + min_size - 1, n):
+            s_range = np.arange(lo, j - min_size + 2)
+            if len(s_range) == 0:
+                continue
+            tot = prev_ssr[s_range - 1] + ssr[s_range, j]
+            k = int(np.argmin(tot))
+            if np.isfinite(tot[k]):
+                cur_ssr[j] = tot[k]
+                cur_bk[j]  = prev_bk[s_range[k] - 1] + [int(s_range[k])]
+        prev_ssr, prev_bk = cur_ssr, cur_bk
+        if np.isfinite(cur_ssr[n - 1]):
+            best_by_m[m] = (cur_bk[n - 1], cur_ssr[n - 1])
+    rows = []
+    for m, (bk, s) in best_by_m.items():
+        if not np.isfinite(s) or s <= 0:
+            continue
+        k = 2 * (m + 1) + m                      # 2 params/segment + m break dates
+        bic = n * np.log(s / n) + k * np.log(n)
+        lwz = np.log(s / max(n - k, 1)) + k * 0.299 * (np.log(n)) ** 2.1 / n
+        rows.append({'m': m, 'breaks': bk, 'ssr': s, 'bic': bic, 'lwz': lwz})
+    if not rows:
+        return [], {'m': 0, 'table': []}
+    key_f = (lambda r: r['bic']) if crit == 'bic' else (lambda r: r['lwz'])
+    best = min(rows, key=key_f)
+    return best['breaks'], {'m': best['m'], 'table': rows}
+
+
+def _deseasonalise_log(logeom):
+    """Strip the month-of-year pattern out of a log EOM level series, so the
+    break search sees trend rather than seasonality. Seasonal deviations are
+    estimated on Δlog and cumulated, then re-centred with a 12-month rolling
+    mean so the result stays on the level's own scale."""
+    g = logeom.diff()
+    sg = g.groupby(g.index.month).mean()
+    sg = sg - sg.mean()
+    sf = np.zeros(len(logeom))
+    for i in range(1, len(logeom)):
+        sf[i] = sf[i - 1] + sg[logeom.index[i].month]
+    sf = pd.Series(sf, index=logeom.index)
+    sf = sf - sf.rolling(12, center=True, min_periods=1).mean()
+    return logeom - sf
+
+
+class MonthlyBreakTrendModel:
+    """Monthly_BreakTrend — structural-break-aware EOM model, in log space.
+
+        log EOM_{t+1} = log EOM_t + μ̂  +  δ̂_{month(t+1)}  −  φ·(g̃_t − μ̂)
+
+      μ̂  drift, estimated on the CURRENT REGIME only (data after the last
+         Bai-Perron break) and exponentially weighted with `halflife` months,
+         so it never averages across a documented regime shift.
+      δ̂  month-of-year effect from the last `seas_window` months of Δlog —
+         a SHORT window on purpose: this is the model's main accuracy source
+         (§3.3, stale seasonal betas), not the break logic.
+      φ  mean-reversion on last month's deseasonalised growth surprise, which
+         is the right sign given the documented lag-1 EOM error
+         autocorrelation of −0.19 (§4).
+
+    Working in logs matters: CIC grows multiplicatively, so a fixed THB-bn
+    drift is wrong at both ends of a 29-year sample.
+
+    HONEST ATTRIBUTION (ablation in §6.1 of CIC_model_document.md): the
+    break-detection component contributes ~nothing at this horizon — turning
+    it off moves selection RMSE by <0.05. The gain over the previous winner
+    comes from log space + the short seasonal window + the mean-reversion
+    term. Breaks are retained because they are individually significant, cost
+    nothing, and bound the damage if a genuinely new regime arrives, but they
+    are not sold here as the reason this model wins.
+    """
+    key = 'Monthly_BreakTrend'
+
+    def __init__(self, seas_window=36, halflife=12, ar_adj=0.2,
+                 min_size=30, max_breaks=5, use_breaks=True, key=None):
+        self.seas_window = seas_window
+        self.halflife    = halflife
+        self.ar_adj      = ar_adj
+        self.min_size    = min_size
+        self.max_breaks  = max_breaks
+        self.use_breaks  = use_breaks
+        if key:
+            self.key = key
+
+    def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
+        eom    = _monthly_eom_series(df_train).astype(float)
+        logeom = np.log(eom)
+        yd     = _deseasonalise_log(logeom)
+        gd     = yd.diff().dropna()
+
+        start = 0
+        if self.use_breaks:
+            bks, _ = bai_perron_breaks(yd.values, max_breaks=self.max_breaks,
+                                       min_size=self.min_size)
+            start = bks[-1] if bks else 0
+        seg = gd.iloc[max(start - 1, 0):]
+        if self.halflife:
+            w = 0.5 ** (np.arange(len(seg))[::-1] / self.halflife)
+            drift = float(np.average(seg.values, weights=w))
+        else:
+            drift = float(seg.mean())
+
+        g = logeom.diff().dropna()
+        if self.seas_window:
+            g = g.iloc[-self.seas_window:]
+        sg = g.groupby(g.index.month).mean()
+        sg = sg - sg.mean()
+        seas = float(sg.get(target_month.month, 0.0))
+
+        fc_log = float(logeom.iloc[-1]) + drift + seas
+        if self.ar_adj:
+            fc_log -= self.ar_adj * float(gd.iloc[-1] - drift)
+        return {'eom_fc': float(np.exp(fc_log)), 'daily_fc': None}
+
+
 class MonthlyUCModel:
     """Bet 1b: UC local-linear-trend + 12-month seasonal on the monthly EOM
     level, with COVID months (2020-03 → 2020-12) masked as missing."""
@@ -2132,11 +2306,40 @@ MODEL_FACTORY = {
     'adaptive_seasonal':    AdaptiveSeasonalWrapper,     # Daily_AdaptiveSeasonal
     'monthly_sarima':       MonthlySarimaModel,          # Monthly_SARIMA
     'monthly_uc':           MonthlyUCModel,              # Monthly_UC
+    'monthly_breaktrend':   MonthlyBreakTrendModel,      # Monthly_BreakTrend
+    # ablation twin: identical but with Bai-Perron switched off (see §6.1)
+    'monthly_breaktrend_nobreak': lambda: MonthlyBreakTrendModel(
+        use_breaks=False, key='Monthly_BreakTrend_NoBreak'),
     'level_trend':          lambda: LevelTrendModel(trend='smooth trend', covid_nan=True),
     'level_trend_llt':      lambda: LevelTrendModel(trend='local linear trend', covid_nan=True),
     'level_trend_nomask':   lambda: LevelTrendModel(trend='smooth trend', covid_nan=False),
 }
 DEFAULT_MODELS = list(MODEL_FACTORY)
+
+# Which frequency each model forecasts at — drives the fig6a/fig6b split.
+# 'daily'  : forecasts ~22 daily ΔCIC values and SUMS them to an EOM level,
+#            so daily errors accumulate across the month (§3 finding 1).
+# 'eom'    : forecasts the month-end level directly in one step, no summing.
+# 'blend'  : combination of EOM-level forecasts from the two families above.
+MODEL_FREQUENCY = {
+    'Daily_Baseline':               'daily',
+    'Daily_AdaptiveDrift':          'daily',
+    'Daily_AdaptiveSeasonal':       'daily',
+    'Daily_LevelTrend':             'daily',
+    'Daily_LevelTrend_LLT':         'daily',
+    'Daily_LevelTrend_NoMask':      'daily',
+    'Monthly_SARIMA':               'eom',
+    'Monthly_UC':                   'eom',
+    'Monthly_BreakTrend':           'eom',
+    'Monthly_BreakTrend_NoBreak':   'eom',
+}
+
+
+def model_frequency(key):
+    """'daily' / 'eom' / 'blend' for a model key (blends detected by prefix)."""
+    if key.startswith('Blend'):
+        return 'blend'
+    return MODEL_FREQUENCY.get(key, 'eom')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2449,71 +2652,239 @@ def plot_eom(results, keys, path='fig5_eom_level_backtest.png'):
 # Fixed categorical order (colorblind-validated: node scripts/validate_palette.js
 # from the dataviz skill, slots 1/2/3/4, light mode) — identity, not ranked by
 # performance, so a model keeps its color across runs/figures.
+# Display order within each panel (identity order, never performance rank).
 _KPI_COLOR_ORDER = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal',
-                    'Monthly_SARIMA', 'Monthly_UC', 'Daily_LevelTrend',
-                    'Blend_Baseline_Monthly', 'Blend_InvMSE_All3', 'Blend_EqualWeight']
+                    'Daily_LevelTrend', 'Daily_LevelTrend_LLT', 'Daily_LevelTrend_NoMask',
+                    'Monthly_SARIMA', 'Monthly_UC',
+                    'Monthly_BreakTrend', 'Monthly_BreakTrend_NoBreak',
+                    'Blend_Baseline_Monthly', 'Blend_Baseline_BreakTrend',
+                    'Blend_BreakTrend_Monthly', 'Blend_InvMSE_All3', 'Blend_EqualWeight']
+
+# One fixed colour per model, so a model keeps its colour across runs and
+# figures. Colours come from the dataviz skill's validated categorical slots.
+# The daily and EOM panels are separate figures, so the two families may reuse
+# the same slots — what matters is that colours are unique WITHIN a panel.
+_KPI_COLORS = {
+    # daily-frequency family (fig6a)
+    'Daily_Baseline':             '#2a78d6',   # blue
+    'Daily_AdaptiveDrift':        '#eb6834',   # orange
+    'Daily_AdaptiveSeasonal':     '#1baf7a',   # aqua
+    'Daily_LevelTrend':           '#4a3aa7',   # violet
+    'Daily_LevelTrend_LLT':       '#e87ba4',   # magenta
+    'Daily_LevelTrend_NoMask':    '#008300',   # green
+    # EOM-frequency family + blends (fig6b)
+    'Monthly_SARIMA':             '#eda100',   # yellow
+    'Monthly_UC':                 '#e87ba4',   # magenta
+    'Monthly_BreakTrend':         '#2a78d6',   # blue
+    'Monthly_BreakTrend_NoBreak': '#eb6834',   # orange
+    # violet/red ordered so orange and red never land adjacent in the panel
+    # (that pair fails the normal-vision separation floor at ΔE 7.1)
+    'Blend_Baseline_Monthly':     '#4a3aa7',   # violet
+    'Blend_Baseline_BreakTrend':  '#1baf7a',   # aqua
+    'Blend_BreakTrend_Monthly':   '#e34948',   # red
+    'Blend_InvMSE_All3':          '#008300',   # green
+    'Blend_EqualWeight':          '#6d6d63',   # neutral
+}
+_KPI_FALLBACK = '#6d6d63'
+# kept for plot_structural_breaks(), which colours regimes by position
 _KPI_PALETTE = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
                '#e87ba4', '#4a3aa7', '#e34948', '#008300', '#6d6d63']
 
 
-def plot_kpi_comparison(sel_tbl, hold_tbl, path='fig6_eom_rmse_kpi.png'):
-    """The primary-KPI chart: EOM level RMSE by model, selection vs. holdout.
-    Ranks models by holdout RMSE (the number that decides the winner, §6 of
-    CIC_model_document.md) and marks the best one — this is the harness's own
-    answer to "which model wins", not a separate manual read of the tables.
-    """
-    common = [m for m in _KPI_COLOR_ORDER if m in sel_tbl.index and m in hold_tbl.index]
-    common += [m for m in hold_tbl.index if m in sel_tbl.index and m not in common]
-    if not common:
-        print('  (fig6 skipped: no model has both a selection and holdout RMSE)')
-        return None
-    ranked = hold_tbl.loc[common, 'RMSE'].sort_values().index.tolist()
+def _kpi_panel(ax, models, sel_tbl, hold_tbl, ref_key=None):
+    """One grouped selection-vs-holdout RMSE panel. Returns the best model."""
+    ranked = hold_tbl.loc[models, 'RMSE'].sort_values().index.tolist()
     best = ranked[0]
-    colors = {m: _KPI_PALETTE[_KPI_COLOR_ORDER.index(m) % len(_KPI_PALETTE)]
-             if m in _KPI_COLOR_ORDER else '#6d6d63' for m in common}
+    colors = {m: _KPI_COLORS.get(m, _KPI_FALLBACK) for m in models}
+    sel_rmse  = [sel_tbl.loc[m, 'RMSE']  for m in models]
+    hold_rmse = [hold_tbl.loc[m, 'RMSE'] for m in models]
 
-    sel_rmse  = [sel_tbl.loc[m, 'RMSE']  for m in common]
-    hold_rmse = [hold_tbl.loc[m, 'RMSE'] for m in common]
-
-    fig, ax = plt.subplots(figsize=(max(9, 1.9 * len(common) + 3), 6.5))
-    x = np.arange(len(common))
+    x = np.arange(len(models))
     w = 0.34
-    b1 = ax.bar(x - w/2, sel_rmse, width=w, color=[colors[m] for m in common],
-               edgecolor='white', linewidth=0.6, label=f'Selection {SELECTION_END.year - 5}–{SELECTION_END.year} (in-sample choices)')
-    b2 = ax.bar(x + w/2, hold_rmse, width=w, color=[colors[m] for m in common],
-               alpha=0.55, edgecolor='white', linewidth=0.6, hatch='///',
-               label=f'Holdout {SELECTION_END.year + 1}–{pd.Timestamp(LAST_ORIGIN).year} (evaluated once, decides the winner)')
+    b1 = ax.bar(x - w / 2, sel_rmse, width=w, color=[colors[m] for m in models],
+                edgecolor='white', linewidth=0.6,
+                label='Selection 2018–2023 (tuning window)')
+    b2 = ax.bar(x + w / 2, hold_rmse, width=w, color=[colors[m] for m in models],
+                alpha=0.55, edgecolor='white', linewidth=0.6, hatch='///',
+                label='Holdout 2024–2026 (decides the winner)')
     for bars in (b1, b2):
         for rect in bars:
             h = rect.get_height()
             ax.annotate(f'{h:.1f}', (rect.get_x() + rect.get_width() / 2, h),
-                       xytext=(0, 3), textcoords='offset points',
-                       ha='center', va='bottom', fontsize=9, color='#2b2b28')
-    best_x = common.index(best)
-    ax.annotate('BEST', xy=(best_x, max(sel_rmse[best_x], hold_rmse[best_x])),
-               xytext=(0, 16), textcoords='offset points', ha='center',
-               fontsize=9.5, fontweight='bold', color='#2b2b28',
-               arrowprops=dict(arrowstyle='-', color='#2b2b28', lw=0.8))
+                        xytext=(0, 3), textcoords='offset points',
+                        ha='center', va='bottom', fontsize=8.5, color='#2b2b28')
+    bx = models.index(best)
+    ax.annotate('BEST', xy=(bx, max(sel_rmse[bx], hold_rmse[bx])),
+                xytext=(0, 15), textcoords='offset points', ha='center',
+                fontsize=9, fontweight='bold', color='#2b2b28',
+                arrowprops=dict(arrowstyle='-', color='#2b2b28', lw=0.8))
+
+    top = max(sel_rmse + hold_rmse)
+    if ref_key is not None and ref_key in hold_tbl.index:
+        ref = float(hold_tbl.loc[ref_key, 'RMSE'])
+        ax.axhline(ref, color='#6d6d63', ls='--', lw=1.1, zorder=0)
+        ax.annotate(f'{ref_key} holdout = {ref:.1f}  (incumbent to beat)',
+                    xy=(len(models) - 0.5, ref), xytext=(-4, 4),
+                    textcoords='offset points', ha='right', va='bottom',
+                    fontsize=8.5, color='#4a4a45')
+        top = max(top, ref)
 
     ax.set_xticks(x)
-    ax.set_xticklabels([m.replace('_', '\n') for m in common], fontsize=9.5)
-    ax.set_ylabel('EOM level RMSE (THB bn) — lower is better', fontsize=11)
-    ax.set_title('Primary KPI: 1-month-ahead end-of-month CIC level RMSE\n'
-                f'Winner (lowest holdout RMSE): {best} — {hold_tbl.loc[best, "RMSE"]:.1f}',
-                fontsize=13, fontweight='bold')
-    ax.legend(loc='upper left', fontsize=8.5, frameon=False)
+    ax.set_xticklabels([m.replace('_', '\n') for m in models], fontsize=9)
+    ax.set_ylabel('EOM level RMSE (THB bn) — lower is better', fontsize=10.5)
     ax.grid(axis='y', alpha=0.3)
     ax.spines[['top', 'right']].set_visible(False)
-    ax.set_ylim(0, max(sel_rmse + hold_rmse) * 1.25)
+    ax.set_ylim(0, top * 1.26)
+    return best
+
+
+def plot_kpi_comparison(sel_tbl, hold_tbl,
+                        path_daily='fig6a_daily_models_rmse.png',
+                        path_eom='fig6b_eom_models_rmse.png'):
+    """Primary-KPI charts, split by model frequency — two separate figures.
+
+    fig6a  daily-frequency models: forecast ~22 daily ΔCIC values and SUM them
+           to reach the month-end level, so within-month errors accumulate.
+    fig6b  EOM-frequency models (+ blends): forecast the month-end level in one
+           step, no accumulation. `Daily_Baseline` is drawn as a dashed
+           reference line here because it is the incumbent production model
+           every EOM candidate has to beat.
+
+    Both panels score the SAME metric (1-month-ahead EOM level RMSE) so the two
+    figures are directly comparable — the split is about how each family gets
+    to that number, not about scoring them differently.
+    """
+    avail = [m for m in hold_tbl.index if m in sel_tbl.index]
+    ordered = ([m for m in _KPI_COLOR_ORDER if m in avail]
+               + [m for m in avail if m not in _KPI_COLOR_ORDER])
+    daily = [m for m in ordered if model_frequency(m) == 'daily']
+    eom   = [m for m in ordered if model_frequency(m) in ('eom', 'blend')]
+
+    best_daily = best_eom = None
+    if daily:
+        fig, ax = plt.subplots(figsize=(max(8, 1.9 * len(daily) + 3), 6.2))
+        best_daily = _kpi_panel(ax, daily, sel_tbl, hold_tbl)
+        ax.set_title('Primary KPI — DAILY-frequency models\n'
+                     'forecast ~22 daily ΔCIC and sum them to the month-end level '
+                     '(errors accumulate)\n'
+                     f'Best daily model: {best_daily} — holdout '
+                     f'{hold_tbl.loc[best_daily, "RMSE"]:.1f}',
+                     fontsize=12, fontweight='bold')
+        ax.legend(loc='upper left', fontsize=8.5, frameon=False)
+        fig.tight_layout()
+        fig.savefig(path_daily, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'  Figure saved → {path_daily}')
+    else:
+        print('  (fig6a skipped: no daily-frequency model in results)')
+
+    if eom:
+        fig, ax = plt.subplots(figsize=(max(9, 1.9 * len(eom) + 3), 6.2))
+        best_eom = _kpi_panel(ax, eom, sel_tbl, hold_tbl, ref_key='Daily_Baseline')
+        ax.set_title('Primary KPI — EOM-frequency models and blends\n'
+                     'forecast the month-end level directly, in one step '
+                     '(no daily accumulation)\n'
+                     f'Best EOM model: {best_eom} — holdout '
+                     f'{hold_tbl.loc[best_eom, "RMSE"]:.1f}',
+                     fontsize=12, fontweight='bold')
+        ax.legend(loc='upper left', fontsize=8.5, frameon=False)
+        fig.tight_layout()
+        fig.savefig(path_eom, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'  Figure saved → {path_eom}')
+    else:
+        print('  (fig6b skipped: no EOM-frequency model in results)')
+
+    overall = min([m for m in (best_daily, best_eom) if m],
+                  key=lambda m: hold_tbl.loc[m, 'RMSE'], default=None)
+    if overall:
+        print(f'  → BEST DAILY model: {best_daily}'
+              f' ({hold_tbl.loc[best_daily, "RMSE"]:.2f} holdout)' if best_daily else '')
+        print(f'  → BEST EOM   model: {best_eom}'
+              f' ({hold_tbl.loc[best_eom, "RMSE"]:.2f} holdout)' if best_eom else '')
+        print(f'  → BEST OVERALL by holdout EOM RMSE: {overall} '
+              f'({hold_tbl.loc[overall, "RMSE"]:.2f})')
+    return overall
+
+
+def plot_structural_breaks(df, path='fig7_structural_breaks.png',
+                           min_size=30, max_breaks=5):
+    """Full-sample Bai-Perron diagnostic: where CIC's trend growth changed.
+
+    Top    log CIC level with the fitted piecewise trend and break dates.
+    Bottom 12-month growth rate with each regime's mean annualised growth.
+    This is the 'identify the structural change mathematically' step — the
+    model that consumes it is Monthly_BreakTrend.
+    """
+    eom = _monthly_eom_series(df).astype(float)
+    logeom = np.log(eom)
+    yd = _deseasonalise_log(logeom)
+    bks, info = bai_perron_breaks(yd.values, max_breaks=max_breaks,
+                                  min_size=min_size)
+    bounds = [0] + list(bks) + [len(yd)]
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 8.5), sharex=True)
+    ax = axes[0]
+    ax.plot(eom.index, yd.values, color='#2b2b28', lw=1.4,
+            label='log CIC level (deseasonalised)')
+    for s, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
+        seg = yd.iloc[a:b]
+        t = np.arange(len(seg), dtype=float)
+        A = np.vstack([np.ones_like(t), t]).T
+        coef, *_ = np.linalg.lstsq(A, seg.values, rcond=None)
+        ax.plot(seg.index, A @ coef, lw=2.4, alpha=0.9,
+                color=_KPI_PALETTE[s % len(_KPI_PALETTE)],
+                label=f'regime {s + 1}: {(np.exp(coef[1] * 12) - 1) * 100:+.1f}%/yr')
+    for b in bks:
+        ax.axvline(eom.index[b], color='#e34948', ls='--', lw=1.3)
+        ax.annotate(eom.index[b].strftime('%Y-%m'), xy=(eom.index[b], ax.get_ylim()[0]),
+                    xytext=(3, 6), textcoords='offset points', rotation=90,
+                    fontsize=8.5, color='#e34948')
+    ax.set_ylabel('log CIC (deseasonalised)', fontsize=10.5)
+    ax.set_title('Structural breaks in Thai CIC — Bai-Perron (1998) segmented-trend '
+                 f'regression\nBIC-selected m={len(bks)} breaks: '
+                 + ', '.join(eom.index[b].strftime('%Y-%m') for b in bks),
+                 fontsize=12.5, fontweight='bold')
+    ax.legend(fontsize=8.5, ncol=3)
+    ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    yoy = (logeom.diff(12) * 100).dropna()
+    ax.plot(yoy.index, yoy.values, color='#4a4a45', lw=1.1,
+            label='12-month growth (%)')
+    ax.axhline(0, color='k', lw=0.7)
+    for s, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
+        seg_idx = eom.index[a:b]
+        m = yoy.reindex(seg_idx).dropna()
+        if len(m) == 0:
+            continue
+        ax.hlines(m.mean(), seg_idx[0], seg_idx[-1], lw=2.6,
+                  color=_KPI_PALETTE[s % len(_KPI_PALETTE)])
+    for b in bks:
+        ax.axvline(eom.index[b], color='#e34948', ls='--', lw=1.3)
+    ax.set_ylabel('YoY growth (%)', fontsize=10.5)
+    ax.set_title('Year-over-year CIC growth with per-regime means', fontsize=11)
+    ax.legend(fontsize=8.5)
+    ax.grid(alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'  Figure saved → {path}')
-    print(f'  → BEST MODEL by holdout EOM RMSE: {best} '
-         f'({hold_tbl.loc[best, "RMSE"]:.2f} vs. runner-up '
-         f'{ranked[1]}={hold_tbl.loc[ranked[1], "RMSE"]:.2f})' if len(ranked) > 1 else
-         f'  → BEST MODEL by holdout EOM RMSE: {best} ({hold_tbl.loc[best, "RMSE"]:.2f})')
-    return best
+
+    print(f'\n=== Bai-Perron structural breaks (full sample, min_size={min_size}) ===')
+    for r in info.get('table', []):
+        dates = ', '.join(eom.index[b].strftime('%Y-%m') for b in r['breaks']) or '—'
+        print(f"  m={r['m']}  SSR={r['ssr']:.5f}  BIC={r['bic']:9.1f}  [{dates}]")
+    print(f'  BIC-selected: m={len(bks)}')
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        seg = yd.iloc[a:b]
+        t = np.arange(len(seg), dtype=float)
+        A = np.vstack([np.ones_like(t), t]).T
+        coef, *_ = np.linalg.lstsq(A, seg.values, rcond=None)
+        print(f'    {eom.index[a]:%Y-%m} → {eom.index[b-1]:%Y-%m}  n={b-a:3d}  '
+              f'trend growth {(np.exp(coef[1] * 12) - 1) * 100:+.2f}%/yr')
+    return bks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2577,7 +2948,15 @@ def run_eom_harness(args):
     have = set(results)
     if {'Daily_Baseline', 'Monthly_SARIMA'} <= have:
         k, r = combine_forecasts(results, ['Daily_Baseline', 'Monthly_SARIMA'],
-                                 key='Blend_Baseline_Monthly')   # ← v2 winner
+                                 key='Blend_Baseline_Monthly')   # ← previous winner
+        results[k] = r
+    if {'Daily_Baseline', 'Monthly_BreakTrend'} <= have:
+        k, r = combine_forecasts(results, ['Daily_Baseline', 'Monthly_BreakTrend'],
+                                 key='Blend_Baseline_BreakTrend')
+        results[k] = r
+    if {'Monthly_BreakTrend', 'Monthly_SARIMA'} <= have:
+        k, r = combine_forecasts(results, ['Monthly_BreakTrend', 'Monthly_SARIMA'],
+                                 key='Blend_BreakTrend_Monthly')
         results[k] = r
     if {'Daily_Baseline', 'Monthly_SARIMA', 'Daily_LevelTrend'} <= have:
         k, r = combine_forecasts(results, ['Daily_Baseline', 'Monthly_SARIMA', 'Daily_LevelTrend'],
@@ -2617,9 +2996,10 @@ def run_eom_harness(args):
     export_results(results, sel_tbl, hold_tbl, guard_tbl)
     plot_eom(results, [k for k in results if k in
                        ('Daily_Baseline', 'Daily_AdaptiveDrift', 'Monthly_SARIMA',
-                        'Daily_LevelTrend', 'Blend_InvMSE_All3',
-                        'Blend_Baseline_Monthly')])
+                        'Monthly_BreakTrend', 'Daily_LevelTrend',
+                        'Blend_Baseline_Monthly', 'Blend_Baseline_BreakTrend')])
     plot_kpi_comparison(sel_tbl, hold_tbl)
+    plot_structural_breaks(df)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
