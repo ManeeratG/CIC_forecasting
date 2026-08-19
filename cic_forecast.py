@@ -239,6 +239,27 @@ def get_X(df, model_name):
     return df[cols].astype(float).values, cols
 
 
+# cic.prg: `smpl 4740 9999` before the `ls(...) ar(1) ma(1)` estimation — obs
+# 4740 in input.xlsx's RAW sheet is 2017-01-04. EViews' Daily_Baseline (and
+# the two state-space variants below, which are built on its same calendar
+# dummy matrix) are trained ONLY on this ~9-year window, not the full 1997+
+# history. Forgetting this floor was making the Python translation's OLS
+# calendar coefficients — and hence its EOM forecasts — diverge sharply from
+# EViews', worse the further out the forecast horizon (the mismatch compounds
+# across day-of-month/month dummies rather than washing out).
+EVIEWS_TRAIN_START = pd.Timestamp('2017-01-04')
+
+
+def eviews_window(df_train):
+    """Floor a Daily_Baseline-family training frame at EVIEWS_TRAIN_START.
+
+    Only the regression sample should be floored — last_level/lev_hist must
+    still be read off the untruncated df_train so the EOM anchor stays the
+    true last observed level.
+    """
+    return df_train.loc[EVIEWS_TRAIN_START:]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3 — FUTURE EXOG GENERATION (for seasonal forecast dot)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,12 +718,13 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
     Rolling monthly backtest: primary KPI = 1-month-ahead end-of-month CIC level RMSE.
 
     For each origin = last trading day of month M (level L_M known):
-      1. Fit all 5 models on data up to origin (expanding window).
+      1. Fit all 3 models on data up to origin (expanding window), floored at
+         EVIEWS_TRAIN_START to match cic.prg's `smpl 4740 9999`.
       2. Forecast all business days of M+1 via generate_future_exog('Daily_Baseline').
       3. EOM level forecast = L_M + Σ ΔCIC_hat over M+1.
       4. Error = actual EOM(M+1) level − forecast.
 
-    All five ARIMAX/StateSpace variants share the same calendar dummy matrix so
+    All three ARIMAX/StateSpace variants share the same calendar dummy matrix so
     the same X_future is reused for all models.
     """
     arimax_models = ['Daily_Baseline']
@@ -746,11 +768,12 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
         if len(X_fut_df) == 0:
             continue
 
-        y_chg = df_train['Change'].values
+        df_bl = eviews_window(df_train)
+        y_chg = df_bl['Change'].values
 
         # ARIMAX models
         for mname in arimax_models:
-            X_tr, _ = get_X(df_train, mname)
+            X_tr, _ = get_X(df_bl, mname)
             try:
                 mdl    = TwoStepARIMAX().fit(y_chg, X_tr)
                 fc     = mdl.forecast(X_fut_df.values)
@@ -773,7 +796,7 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
                 print(f'    ⚠ {mname} EOM {origin.date()}: {exc}')
 
         # Daily_AdaptiveDrift — uses Daily_Baseline regressors
-        X_tr_ss, _ = get_X(df_train, 'Daily_Baseline')
+        X_tr_ss, _ = get_X(df_bl, 'Daily_Baseline')
         try:
             mdl    = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(y_chg, X_tr_ss)
             fc     = mdl.forecast(X_fut_df.values)
@@ -796,9 +819,9 @@ def month_end_eom_backtest(df, hol, start_year=2020, end_year=2025):
             print(f'    ⚠ Daily_AdaptiveDrift EOM {origin.date()}: {exc}')
 
         # Daily_AdaptiveSeasonal — uses Daily_Baseline regressors with trailing-window OLS
-        X_tr_m3, _ = get_X(df_train, 'Daily_Baseline')
+        X_tr_m3, _ = get_X(df_bl, 'Daily_Baseline')
         try:
-            mdl    = AdaptiveSeasonalModel().fit(y_chg, X_tr_m3, dates=df_train.index)
+            mdl    = AdaptiveSeasonalModel().fit(y_chg, X_tr_m3, dates=df_bl.index)
             fc     = mdl.forecast(X_fut_df.values)
             fc_eom = last_level + float(fc.sum())
             store['Daily_AdaptiveSeasonal']['dates'].append(nm_end)
@@ -1731,19 +1754,26 @@ LAST_ORIGIN    = '2026-03-31'                 # targets April 2026 (last complet
 # Every model implements:
 #   fit_forecast(df_train, X_fut_df, last_level, target_month) ->
 #       {'eom_fc': float, 'daily_fc': np.ndarray | None}
-# df_train      : full history up to the origin (expanding window)
+# df_train      : full history up to the origin (expanding window). The three
+#                 Daily_Baseline-family models (BaselineModel,
+#                 AdaptiveDriftWrapper, AdaptiveSeasonalWrapper) internally
+#                 floor this at EVIEWS_TRAIN_START (see eviews_window()) to
+#                 match cic.prg's `smpl 4740 9999`; other models use the full
+#                 frame as given.
 # X_fut_df      : Daily_Baseline dummy matrix for the target month's trading days
 # last_level    : CIC level at the origin (L_M)
 # target_month  : pd.Period of month M+1
 
 class BaselineModel:
     """Daily_Baseline — the 2022 EViews model replicated: OLS on 55 calendar
-    dummies + ARIMA(1,0,1) on the residuals (two-step ARIMAX)."""
+    dummies + ARIMA(1,0,1) on the residuals (two-step ARIMAX), trained on the
+    same 2017-01-04+ window as cic.prg's `smpl 4740 9999`."""
     key = 'Daily_Baseline'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
-        X_tr, _ = get_X(df_train, 'Daily_Baseline')
-        mdl = TwoStepARIMAX().fit(df_train['Change'].values, X_tr)
+        df_bl = eviews_window(df_train)
+        X_tr, _ = get_X(df_bl, 'Daily_Baseline')
+        mdl = TwoStepARIMAX().fit(df_bl['Change'].values, X_tr)
         fc  = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
@@ -1753,8 +1783,9 @@ class AdaptiveDriftWrapper:
     key = 'Daily_AdaptiveDrift'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
-        X_tr, _ = get_X(df_train, 'Daily_Baseline')
-        mdl = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(df_train['Change'].values, X_tr)
+        df_bl = eviews_window(df_train)
+        X_tr, _ = get_X(df_bl, 'Daily_Baseline')
+        mdl = AdaptiveDriftModel('Daily_AdaptiveDrift').fit(df_bl['Change'].values, X_tr)
         fc  = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
@@ -1770,11 +1801,12 @@ class AdaptiveSeasonalWrapper:
             self.key = f'Daily_AdaptiveSeasonal_{trailing_months}m'
 
     def fit_forecast(self, df_train, X_fut_df, last_level, target_month):
-        X_tr, _ = get_X(df_train, 'Daily_Baseline')
+        df_bl = eviews_window(df_train)
+        X_tr, _ = get_X(df_bl, 'Daily_Baseline')
         mdl = AdaptiveSeasonalModel()
         if self.trailing_months:
             mdl.TRAILING_MONTHS = self.trailing_months
-        mdl.fit(df_train['Change'].values, X_tr, dates=df_train.index)
+        mdl.fit(df_bl['Change'].values, X_tr, dates=df_bl.index)
         fc = np.asarray(mdl.forecast(X_fut_df.values), float)
         return {'eom_fc': last_level + float(fc.sum()), 'daily_fc': fc}
 
