@@ -1002,8 +1002,8 @@ def plot_seasonal_pattern(df, nowcast_fc=None, pure_fc=None, fan_roles=None,
         ax.plot(valid.index, valid.values, color=cmap_colors[i], marker='o', ms=4,
                 label=str(yr), **style)
 
-    def _zoom(axz, fc, target, marker, title_prefix):
-        order = list(fc)
+    def _zoom(axz, fc, target, marker, title):
+        order = sorted(fc, key=lambda m: fc[m], reverse=True)   # max -> min
         vals = list(fc.values())
         lo, hi = min(vals), max(vals)
         for i, mname in enumerate(order):
@@ -1023,8 +1023,7 @@ def plot_seasonal_pattern(df, nowcast_fc=None, pure_fc=None, fan_roles=None,
         axz.set_xlim(-0.7, len(order) - 0.3)
         axz.set_xticks(range(len(order)))
         axz.set_xticklabels([m.replace('_', '\n') for m in order], fontsize=8.5)
-        axz.set_title(f'{title_prefix} — {target:%b %Y}\nspread = {hi - lo:,.1f} THB bn',
-                     fontsize=10.5, fontweight='bold')
+        axz.set_title(f'{title} — {target:%b %Y}', fontsize=10.5, fontweight='bold')
         axz.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:,.0f}'))
         axz.grid(axis='y', alpha=0.3)
         axz.spines[['top', 'right']].set_visible(False)
@@ -1047,19 +1046,9 @@ def plot_seasonal_pattern(df, nowcast_fc=None, pure_fc=None, fan_roles=None,
                 ax.plot([mo], [lvl], marker=marker, ms=9 if marker == 'o' else 10,
                         lw=0, zorder=10, color=_KPI_COLORS.get(mname, _KPI_FALLBACK),
                         markeredgecolor='black', markeredgewidth=0.8)
-        ax.annotate(f'{nowcast_target:%b %Y}\nnowcast', xy=(mo_now, min(nowcast_fc.values())),
-                    xytext=(-8, -34), textcoords='offset points', ha='center',
-                    fontsize=8.5, fontweight='bold', color='#2b2b28',
-                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
-        ax.annotate(f'{pure_target:%b %Y}\npure forecast', xy=(mo_pure, max(pure_fc.values())),
-                    xytext=(8, 30), textcoords='offset points', ha='center',
-                    fontsize=8.5, fontweight='bold', color='#2b2b28',
-                    arrowprops=dict(arrowstyle='->', color='#2b2b28', lw=0.9))
 
-        _zoom(axz1, nowcast_fc, nowcast_target, 'o',
-             'Zoom — nowcast\n(partial month + forecast remainder)')
-        _zoom(axz2, pure_fc, pure_target, '^',
-             'Zoom — pure forecast\n(no partial-month data)')
+        _zoom(axz1, nowcast_fc, nowcast_target, 'o', 'Zoom — Nowcast')
+        _zoom(axz2, pure_fc, pure_target, '^', 'Zoom — Pure forecast')
 
     month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -1086,14 +1075,19 @@ def plot_seasonal_pattern(df, nowcast_fc=None, pure_fc=None, fan_roles=None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8d — CIC OUTPUT EXCEL (single consolidated user-facing workbook)
+# SECTION 8d — EXCEL WRITER HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-# CIC_output.xlsx is the one Excel deliverable: the daily pipeline (below) and
-# the --eom harness (export_results(), Part 2) both write into it. Each writer
-# only ever replaces the sheets it owns — daily pipeline: Daily / Monthly EOM /
-# Summary; --eom harness: EOM_Selection / EOM_Holdout / EOM_Detail /
-# Daily_Guardrail — so running one after the other accumulates, it never wipes
-# the other's sheets. Whichever runs first creates the file.
+# Two Excel files now, split by audience:
+#   CIC_output.xlsx           production — Daily / EOM / Summary, top 3
+#                              models + Daily_Baseline only (export_cic_output(),
+#                              Part 2, since it needs the harness's model ranking)
+#   cic_forecast_output.xlsx  research — every RMSE/backtest detail, every
+#                              model (export_excel() below + export_results(),
+#                              Part 2)
+# Both files are written by writers on two different code paths (the daily
+# pipeline and the --eom harness), so both use _excel_writer() below
+# (append/replace-by-name) — whichever path runs first creates the file,
+# the other accumulates sheets into it rather than truncating it.
 
 def _excel_writer(path):
     """pd.ExcelWriter that appends/replaces sheets in an existing workbook
@@ -1101,273 +1095,6 @@ def _excel_writer(path):
     if os.path.exists(path):
         return pd.ExcelWriter(path, engine='openpyxl', mode='a', if_sheet_exists='replace')
     return pd.ExcelWriter(path, engine='openpyxl', mode='w')
-
-
-def export_cic_output_excel(df, configs_results, hol, save_dir='.'):
-    """
-    CIC_output.xlsx — 3 tabs:
-
-    Daily       : date | CIC actual | one column per model (CIC level, 1-step-ahead)
-                  OOS 2020-present + 2 months forward; yellow = forecast rows
-
-    Monthly EOM : date | CIC actual | CIC actual change | one EOM column per model
-                  Yellow = forecast rows
-
-    Summary     : rows = one per model + Avg Post-COVID Seasonal (SUMPRODUCT formula)
-                  cols = next 2 forecast months
-                  values = monthly CIC change
-    """
-    from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-
-    YELLOW  = PatternFill(start_color='FFFFC0', end_color='FFFFC0', fill_type='solid')
-    BLUE_HD = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
-    GREY_HD = PatternFill(start_color='595959', end_color='595959', fill_type='solid')
-    HDR_FONT = Font(color='FFFFFF', bold=True)
-    BOLD     = Font(bold=True)
-
-    path = os.path.join(save_dir, 'CIC_output.xlsx')
-
-    # ── Source data ──
-    main = configs_results['cfg_main']
-    df_train   = main['df_train']
-    df_eval    = main['df_eval']
-    forecasts  = main['forecasts']          # mname -> np.array of daily change forecasts
-
-    # Display order: baseline first, then the adaptive variants
-    MODEL_ORDER = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
-
-    last_actual     = df['Currency'].dropna().index.max()
-    last_actual_eom = df['Currency'].dropna().resample('ME').last().dropna().index.max()
-    last_train_lv   = df_train['Currency'].dropna().iloc[-1]
-
-    # ── 1-step-ahead daily CIC level for each model (OOS period) ──
-    # level_t = actual_{t-1} + model_forecast_change_t
-    actual_prev = df['Currency'].shift(1)
-
-    oos_level = {}
-    for mname in MODEL_ORDER:
-        fc_arr = forecasts.get(mname)
-        if fc_arr is None:
-            continue
-        fc_s = pd.Series(fc_arr, index=df_eval.index)
-        oos_level[mname] = actual_prev[df_eval.index] + fc_s
-
-    # ── 2-month future daily forecasts (cumulative from last actual) ──
-    fc_start = (last_actual + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    fc_end   = (last_actual_eom + pd.offsets.MonthEnd(2)).strftime('%Y-%m-%d')  # 2 full future months
-
-    future_fc    = {}   # mname -> pd.Series(change, future dates)
-    future_level = {}   # mname -> pd.Series(level, future dates)
-    for mname in MODEL_ORDER:
-        mdl = main['fitted_models'].get(mname)
-        if mdl is None:
-            continue
-        try:
-            key = 'Daily_Baseline' if mname in ('Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal') else mname
-            X_fut = generate_future_exog(key, fc_start, fc_end, hol)
-            if not len(X_fut):
-                continue
-            fc_chg = mdl.forecast(X_fut.values)
-            future_fc[mname] = pd.Series(fc_chg, index=X_fut.index)
-            lvl = df['Currency'].dropna().iloc[-1]
-            lvls = []
-            for chg in fc_chg:
-                lvl += chg
-                lvls.append(lvl)
-            future_level[mname] = pd.Series(lvls, index=X_fut.index)
-        except Exception as e:
-            print(f'  (future fc skipped {mname}: {e})')
-
-    # ── Build Daily DataFrame ──
-    # Rows: OOS 2020-present + future 2 months
-    actual_oos = df.loc[df_eval.index, 'Currency']
-    daily_rows = []
-    # OOS actual rows
-    for dt in df_eval.index:
-        row = {'Date': dt, 'CIC Actual (bn.)': actual_oos.get(dt, np.nan)}
-        for mname in MODEL_ORDER:
-            lbl = f'CIC {BASE_LABELS.get(mname, mname)}'
-            row[lbl] = oos_level.get(mname, pd.Series(dtype=float)).get(dt, np.nan)
-        daily_rows.append(row)
-    # Future forecast rows
-    if future_level:
-        ref_idx = next(iter(future_level.values())).index
-        for dt in ref_idx:
-            row = {'Date': dt, 'CIC Actual (bn.)': np.nan}
-            for mname in MODEL_ORDER:
-                lbl = f'CIC {BASE_LABELS.get(mname, mname)}'
-                row[lbl] = future_level.get(mname, pd.Series(dtype=float)).get(dt, np.nan)
-            daily_rows.append(row)
-    daily_df = pd.DataFrame(daily_rows)
-    n_oos_rows = len(df_eval)  # forecast rows start after these
-
-    # ── Build Monthly EOM DataFrame ──
-    eom_actual = df['Currency'].dropna().resample('ME').last()
-    eom_actual_chg = eom_actual.diff()
-
-    # OOS EOM levels from 1-step-ahead forecasts
-    eom_oos = {}
-    for mname, lev_s in oos_level.items():
-        eom_oos[mname] = lev_s.resample('ME').last()
-
-    # Future EOM levels
-    eom_future = {}
-    for mname, lev_s in future_level.items():
-        eom_future[mname] = lev_s.resample('ME').last()
-
-    # Collect all months (actual + future)
-    all_months = sorted(set(eom_actual.index) | set().union(*[s.index for s in eom_future.values()]) if eom_future else set(eom_actual.index))
-    eom_rows = []
-    for mo in all_months:
-        is_fc = mo > last_actual
-        row = {
-            'Date': mo,
-            'CIC Actual (bn.)': eom_actual.get(mo, np.nan),
-            'CIC Actual Change (bn.)': eom_actual_chg.get(mo, np.nan),
-        }
-        for mname in MODEL_ORDER:
-            lbl = f'CIC {BASE_LABELS.get(mname, mname)}'
-            if is_fc:
-                val = eom_future.get(mname, pd.Series(dtype=float)).get(mo, np.nan)
-            else:
-                val = eom_oos.get(mname, pd.Series(dtype=float)).get(mo, np.nan)
-            row[lbl] = val
-        eom_rows.append(row)
-    eom_df = pd.DataFrame(eom_rows)
-    n_actual_eom = int((eom_df['Date'] <= last_actual).sum())
-
-    # ── Build Summary DataFrame ──
-    # Columns = next 2 forecast months, Rows = 2 models + avg seasonal
-    summary_models   = ['Daily_Baseline', 'Daily_AdaptiveDrift', 'Daily_AdaptiveSeasonal']
-    summary_row_lbls = [BASE_LABELS.get(m, m) for m in summary_models] + ['Avg Post-COVID Seasonal']
-
-    # Identify the 2 forecast month-end dates (strictly after last actual EOM)
-    last_actual_eom = eom_actual.dropna().index.max()
-    fc_months = sorted(
-        m for m in (eom_future[next(iter(eom_future))].index if eom_future else [])
-        if m > last_actual_eom
-    )[:2]
-
-    # For each model: monthly change = forecast EOM level - previous EOM level
-    def eom_change_for_month(mname, mo):
-        prev_mos = [m for m in all_months if m < mo]
-        if not prev_mos:
-            return np.nan
-        prev_mo = prev_mos[-1]
-        cur_lev  = eom_future.get(mname, pd.Series(dtype=float)).get(mo, np.nan)
-        prev_lev_fc  = eom_future.get(mname, pd.Series(dtype=float)).get(prev_mo, np.nan)
-        prev_lev_act = eom_actual.get(prev_mo, np.nan)
-        prev_lev = prev_lev_fc if not np.isnan(prev_lev_fc) else prev_lev_act
-        return cur_lev - prev_lev if not np.isnan(cur_lev) and not np.isnan(prev_lev) else np.nan
-
-    summary_data = {}
-    for mo in fc_months:
-        col_lbl = mo.strftime('%b %Y')
-        col_vals = []
-        for mname in summary_models:
-            col_vals.append(eom_change_for_month(mname, mo))
-        col_vals.append(None)  # placeholder for formula row
-        summary_data[col_lbl] = col_vals
-
-    summary_df = pd.DataFrame(summary_data, index=summary_row_lbls)
-    summary_df.index.name = 'Model'
-
-    # ── Write to Excel (append-safe: preserves any EOM_* sheets from --eom) ──
-    with _excel_writer(path) as writer:
-        daily_df.to_excel(writer, sheet_name='Daily', index=False)
-        eom_df.to_excel(writer, sheet_name='Monthly EOM', index=False)
-        summary_df.reset_index().to_excel(writer, sheet_name='Summary', index=False)
-
-    # ── Style with openpyxl ──
-    wb = load_workbook(path)
-
-    def style_sheet(ws, forecast_start_row, n_cols, freeze_col=1):
-        thin = Side(style='thin', color='CCCCCC')
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
-        for col in range(1, n_cols + 1):
-            cell = ws.cell(row=1, column=col)
-            cell.fill      = BLUE_HD
-            cell.font      = HDR_FONT
-            cell.alignment = Alignment(horizontal='center', wrap_text=True)
-        for row in ws.iter_rows(min_row=2):
-            is_fc = row[0].row >= forecast_start_row
-            for cell in row:
-                if is_fc:
-                    cell.fill = YELLOW
-                cell.border = border
-                if cell.column == 1:
-                    cell.number_format = 'YYYY-MM-DD'
-                elif cell.value is not None and isinstance(cell.value, (int, float)):
-                    cell.number_format = '#,##0.00'
-        for col in ws.columns:
-            max_len = max((len(str(c.value)) if c.value else 0) for c in col)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 3, 28)
-        ws.freeze_panes = ws.cell(row=2, column=freeze_col + 1)
-
-    # Daily
-    style_sheet(wb['Daily'], n_oos_rows + 2, daily_df.shape[1])
-
-    # Monthly EOM
-    style_sheet(wb['Monthly EOM'], n_actual_eom + 2, eom_df.shape[1])
-
-    # Summary — custom styling + SUMPRODUCT formulas for last row
-    ws_s = wb['Summary']
-    n_s_cols = summary_df.shape[1] + 1  # +1 for index col
-
-    # Style header
-    for col in range(1, n_s_cols + 1):
-        cell = ws_s.cell(row=1, column=col)
-        cell.fill = GREY_HD
-        cell.font = HDR_FONT
-        cell.alignment = Alignment(horizontal='center')
-
-    # Style data rows
-    thin = Side(style='thin', color='CCCCCC')
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for row in ws_s.iter_rows(min_row=2):
-        for cell in row:
-            cell.border = border
-            if cell.column == 1:
-                cell.font = BOLD
-            elif cell.value is not None and isinstance(cell.value, (int, float)):
-                cell.number_format = '#,##0.00'
-
-    # Write SUMPRODUCT formula for "Avg Post-COVID Seasonal" row
-    # Last data row in summary = row (len(summary_row_lbls) + 1) = row 5
-    avg_row = len(summary_row_lbls) + 1  # row index in worksheet (1-based, +1 for header)
-    # Monthly EOM tab: col A = Date, col C = CIC Actual Change
-    # fc_months[i] is in col (i+2) of summary (col B, C, ...)
-    for col_idx, mo in enumerate(fc_months, start=2):
-        mo_num = mo.month
-        # =SUMPRODUCT((MONTH('Monthly EOM'!$A$2:$A$500)=mo_num)*
-        #             ('Monthly EOM'!$A$2:$A$500>=DATE(2021,1,1))*
-        #             ('Monthly EOM'!$A$2:$A$500<=DATE(2025,12,31))*
-        #             ISNUMBER('Monthly EOM'!$C$2:$C$500)*
-        #             ('Monthly EOM'!$C$2:$C$500))
-        # / SUMPRODUCT(...)
-        rng_a = "'Monthly EOM'!$A$2:$A$500"
-        rng_c = "'Monthly EOM'!$C$2:$C$500"
-        cond  = (f"(MONTH({rng_a})={mo_num})*"
-                 f"({rng_a}>=DATE(2021,1,1))*"
-                 f"({rng_a}<=DATE(2025,12,31))*"
-                 f"ISNUMBER({rng_c})")
-        formula = (f"=SUMPRODUCT({cond}*({rng_c}))"
-                   f"/SUMPRODUCT({cond}*1)")
-        cell = ws_s.cell(row=avg_row, column=col_idx)
-        cell.value = formula
-        cell.number_format = '#,##0.00'
-        cell.fill   = YELLOW
-        cell.border = border
-
-    # Auto-width summary
-    for col in ws_s.columns:
-        max_len = max((len(str(c.value)) if c.value else 0) for c in col)
-        ws_s.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 30)
-
-    wb.save(path)
-    print(f'  Saved → ./CIC_output.xlsx')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1389,10 +1116,16 @@ def export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res,
     Rolling_RMSE    – expanding-window backtest
     Horizon_RMSE    – multi-horizon RMSE
     GARCH_Params    – GARCH(1,1) estimates
+
+    Plus, from the --eom harness (export_results()): EOM_Selection,
+    EOM_Holdout, EOM_Detail, Daily_Guardrail, for every model run. Both
+    writers use _excel_writer() (append/replace-by-name), so running the
+    daily pipeline and --eom in either order accumulates sheets in this one
+    file rather than one truncating the other's.
     """
     path = os.path.join(save_dir, 'cic_forecast_output.xlsx')
 
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+    with _excel_writer(path) as writer:
 
         # ── Eval sheets: one row per eval observation, all models side by side ──
         for cfg_key, cfg_data in configs_results.items():
@@ -1865,12 +1598,12 @@ def run_full_pipeline():
     # error history those figures compare.
 
     # ── 10. Excel ──
+    # cic_forecast_output.xlsx only — CIC_output.xlsx (Daily / EOM / Summary)
+    # is built entirely from the --eom harness's own model rankings now
+    # (export_cic_output(), called from run_eom_harness), since "best
+    # daily/EOM/blend" aren't concepts the daily pipeline alone has.
     print('\n[10] Exporting Excel output...')
     export_excel(df, configs_results, rolling_metrics, h_rmse, garch_res, eom_results)
-
-    # Clean user-facing workbook
-    print('  Exporting CIC_output.xlsx (Daily / Monthly EOM / Summary)...')
-    export_cic_output_excel(df, configs_results, hol)
 
     # ── Final summary ──
     print('\n' + sep)
@@ -2652,17 +2385,16 @@ def top_models_for_export(hold_tbl, n=3, always_include=('Daily_Baseline',)):
     return keep
 
 
-def export_results(results, sel_tbl, hold_tbl, guard_tbl, path='CIC_output.xlsx',
-                   keep=None):
-    """Writes EOM_Selection / EOM_Holdout / EOM_Detail / Daily_Guardrail into the
-    single consolidated workbook (see _excel_writer) — append-safe, so this never
-    wipes the Daily / Monthly EOM / Summary sheets from the daily pipeline.
-
-    `keep` restricts every sheet to that set of model keys (see
-    top_models_for_export()); None writes every model in `results`, which is
-    what the harness's OWN diagnostics (fig4, fig5a/b/c) still see regardless —
-    only the Excel export is narrowed, so nothing is lost, just not dumped into
-    the workbook a production user opens.
+def export_results(results, sel_tbl, hold_tbl, guard_tbl,
+                   path='cic_forecast_output.xlsx', keep=None):
+    """Writes EOM_Selection / EOM_Holdout / EOM_Detail / Daily_Guardrail —
+    every model's full RMSE detail — into cic_forecast_output.xlsx
+    (append-safe, see _excel_writer; shared with the daily pipeline's
+    export_excel(), so neither wipes the other's sheets). `keep`, if given,
+    restricts to that set of model keys (see top_models_for_export()); the
+    default None keeps everything, which is what this file is for — the
+    narrowed, production-facing numbers live in CIC_output.xlsx instead
+    (export_cic_output()).
     """
     if keep is not None:
         sel_tbl  = sel_tbl.loc[[m for m in sel_tbl.index if m in keep]]
@@ -2775,25 +2507,152 @@ def _model_two_step(inst, cli, df_train, hol, last_actual_level,
       this month are already IN last_actual_level, not re-forecast); the
       pure forecast then sums a full month of forecast days onto the
       nowcast.
+
+    Returns (nowcast_val, pure_val, daily_path). `daily_path` is
+    (DatetimeIndex, np.ndarray of levels) spanning both legs end-to-end for
+    daily-frequency models — used to build CIC_output.xlsx's Daily sheet —
+    or None for EOM-frequency models, which have no daily granularity.
     """
     if isinstance(inst, MonthlySarimaModel):
-        return _two_step_monthly_sarima(df_train)
+        nc, pf = _two_step_monthly_sarima(df_train)
+        return nc, pf, None
     if isinstance(inst, MonthlyUCModel):
-        return _two_step_monthly_uc(df_train)
+        nc, pf = _two_step_monthly_uc(df_train)
+        return nc, pf, None
     if isinstance(inst, MonthlyBreakTrendModel):
         nowcast = inst.fit_forecast(df_train, None, last_actual_level,
                                     nowcast_period)['eom_fc']
         pure = MODEL_FACTORY[cli]().fit_forecast(
             df_train, None, nowcast, pure_period, anchor_ar=False)['eom_fc']
-        return nowcast, pure
+        return nowcast, pure, None
     # daily-frequency contract
     X_remaining = generate_future_exog('Daily_Baseline', remaining_start, remaining_end, hol)
-    nowcast = inst.fit_forecast(df_train, X_remaining, last_actual_level,
-                                nowcast_period)['eom_fc']
+    out1 = inst.fit_forecast(df_train, X_remaining, last_actual_level, nowcast_period)
+    nowcast = out1['eom_fc']
     X_pure = generate_future_exog('Daily_Baseline', pure_start, pure_end, hol)
-    pure = MODEL_FACTORY[cli]().fit_forecast(
-        df_train, X_pure, nowcast, pure_period)['eom_fc']
-    return nowcast, pure
+    out2 = MODEL_FACTORY[cli]().fit_forecast(df_train, X_pure, nowcast, pure_period)
+    pure = out2['eom_fc']
+    dates  = X_remaining.index.append(X_pure.index)
+    lvl1   = last_actual_level + np.cumsum(np.asarray(out1['daily_fc'], float))
+    lvl2   = nowcast + np.cumsum(np.asarray(out2['daily_fc'], float))
+    levels = np.concatenate([lvl1, lvl2])
+    return nowcast, pure, (dates, levels)
+
+
+def _pick_by_frequency(freq, hold_tbl, results):
+    """Best model of one frequency family by holdout RMSE (the number that
+    decides the winner, §6) — ablation-only variants excluded
+    (is_selectable()). Shared by future_fan_forecasts() and
+    export_cic_output() so both agree on what "best daily/EOM/blend" means."""
+    cand = [m for m in hold_tbl.index
+            if model_frequency(m) == freq and m in results and is_selectable(m)]
+    if not cand:
+        return None
+    return hold_tbl.loc[cand, 'RMSE'].idxmin()
+
+
+def _forecast_models_two_step(model_keys, df, hol, results, hold_tbl,
+                              window=12, floor=0.1):
+    """Nowcast + pure-forecast (see future_fan_forecasts()'s docstring for what
+    those mean) for an ARBITRARY set of model keys. Blends in `model_keys`
+    have their members resolved automatically (via the `w_<member>` columns
+    combine_forecasts() leaves in `results`) and forecast too, even if not
+    independently requested.
+
+    This is the shared engine behind fig3 (future_fan_forecasts, 4 models by
+    role) and CIC_output.xlsx (export_cic_output(), top-3-by-holdout +
+    incumbent) — both call this once so their numbers can never disagree.
+
+    Returns (nowcast, pure, daily_paths, last_actual_date, origin,
+    nowcast_target, pure_target). `daily_paths` is {model_key: (dates,
+    levels)} for daily-frequency models actually computed (see
+    _model_two_step's docstring) — used for CIC_output.xlsx's Daily sheet.
+    """
+    lev = df['Currency'].dropna()
+    last_actual_date  = lev.index.max()
+    last_actual_level = float(lev.iloc[-1])
+    cur_period     = last_actual_date.to_period('M')
+    cur_period_end = cur_period.to_timestamp('M')
+    is_partial = (cur_period_end - last_actual_date).days > 4
+
+    if is_partial:
+        origin_period, nowcast_period = cur_period - 1, cur_period
+    else:
+        origin_period, nowcast_period = cur_period, cur_period + 1
+    pure_period = nowcast_period + 1
+
+    origin = lev.loc[:origin_period.to_timestamp('M')].index.max()
+    df_train = df.loc[:origin]
+
+    remaining_start = (last_actual_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    remaining_end   = nowcast_period.to_timestamp('M').strftime('%Y-%m-%d')
+    pure_start      = (nowcast_period.to_timestamp('M') + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    pure_end        = pure_period.to_timestamp('M').strftime('%Y-%m-%d')
+
+    key_to_factory = {}
+    for cli_name, factory in MODEL_FACTORY.items():
+        try:
+            key_to_factory.setdefault(factory().key, cli_name)
+        except Exception:
+            continue
+
+    nowcast, pure, daily_paths = {}, {}, {}
+
+    def forecast_one(m):
+        if m in nowcast:
+            return
+        cli = key_to_factory.get(m)
+        if cli is None:
+            return
+        try:
+            inst = MODEL_FACTORY[cli]()
+            nc, pf, dp = _model_two_step(inst, cli, df_train, hol, last_actual_level,
+                                         remaining_start, remaining_end,
+                                         pure_start, pure_end,
+                                         nowcast_period, pure_period)
+            nowcast[m] = float(nc)
+            pure[m]    = float(pf)
+            if dp is not None:
+                daily_paths[m] = dp
+        except Exception as exc:
+            print(f'  (two-step forecast: {m} failed — {exc})')
+
+    for m in model_keys:
+        if model_frequency(m) != 'blend':
+            forecast_one(m)
+
+    # Resolve every blend's members BEFORE any cleanup — a member shared by
+    # two requested blends must survive until both have consumed it.
+    extra_members = set()
+    for blend_key in [m for m in model_keys if model_frequency(m) == 'blend']:
+        if blend_key not in results:
+            continue
+        members = [k for k in results
+                   if k != blend_key and f'w_{k}' in results[blend_key].columns]
+        for k in members:
+            forecast_one(k)
+            if k not in model_keys:
+                extra_members.add(k)
+        if members and all(k in nowcast for k in members):
+            ws = []
+            for k in members:
+                past = results[k]['error'].tail(window)
+                ws.append(1.0 / max(float((past ** 2).mean()), 1e-9)
+                          if len(past) else np.nan)
+            ws = np.array(ws, float)
+            ws = np.ones(len(members)) if np.isnan(ws).any() else ws
+            ws = ws / ws.sum()
+            ws = np.maximum(ws, floor)
+            ws = ws / ws.sum()
+            nowcast[blend_key] = float(np.dot(ws, [nowcast[k] for k in members]))
+            pure[blend_key]    = float(np.dot(ws, [pure[k] for k in members]))
+    for k in extra_members:               # members fitted only to build a blend
+        nowcast.pop(k, None)
+        pure.pop(k, None)
+        daily_paths.pop(k, None)
+
+    return (nowcast, pure, daily_paths, last_actual_date, origin,
+            nowcast_period.to_timestamp('M'), pure_period.to_timestamp('M'))
 
 
 def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
@@ -2825,39 +2684,10 @@ def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
     Returns (nowcast_fan, pure_fan, roles, last_actual_date, origin,
     nowcast_target, pure_target).
     """
-    lev = df['Currency'].dropna()
-    last_actual_date  = lev.index.max()
-    last_actual_level = float(lev.iloc[-1])
-    cur_period     = last_actual_date.to_period('M')
-    cur_period_end = cur_period.to_timestamp('M')
-    is_partial = (cur_period_end - last_actual_date).days > 4
-
-    if is_partial:
-        origin_period, nowcast_period = cur_period - 1, cur_period
-    else:
-        origin_period, nowcast_period = cur_period, cur_period + 1
-    pure_period = nowcast_period + 1
-
-    origin = lev.loc[:origin_period.to_timestamp('M')].index.max()
-    df_train = df.loc[:origin]
-
-    remaining_start = (last_actual_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    remaining_end   = nowcast_period.to_timestamp('M').strftime('%Y-%m-%d')
-    pure_start      = (nowcast_period.to_timestamp('M') + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    pure_end        = pure_period.to_timestamp('M').strftime('%Y-%m-%d')
-
-    def pick(freq):
-        cand = [m for m in hold_tbl.index
-                if model_frequency(m) == freq and m in results and is_selectable(m)]
-        if not cand:
-            return None
-        return hold_tbl.loc[cand, 'RMSE'].idxmin()
-
-    # role → model. If the best daily model IS the incumbent the two roles
-    # collapse onto one dot; the label then says so rather than inventing a
-    # second daily model just to fill the slot.
-    roles = [('incumbent', 'Daily_Baseline'), ('best daily', pick('daily')),
-             ('best EOM', pick('eom')), ('best blend', pick('blend'))]
+    roles = [('incumbent', 'Daily_Baseline'),
+             ('best daily', _pick_by_frequency('daily', hold_tbl, results)),
+             ('best EOM', _pick_by_frequency('eom', hold_tbl, results)),
+             ('best blend', _pick_by_frequency('blend', hold_tbl, results))]
     role_of, chosen = {}, []
     for role, m in roles:
         if not m:
@@ -2868,64 +2698,187 @@ def future_fan_forecasts(df, hol, results, hold_tbl, window=12, floor=0.1):
             role_of[m] = role
             chosen.append(m)
 
-    key_to_factory = {}
-    for cli_name, factory in MODEL_FACTORY.items():
-        try:
-            key_to_factory.setdefault(factory().key, cli_name)
-        except Exception:
-            continue
+    (nowcast, pure, _daily_paths, last_actual_date, origin,
+     nowcast_target, pure_target) = _forecast_models_two_step(
+        chosen, df, hol, results, hold_tbl, window, floor)
 
-    nowcast_fan, pure_fan = {}, {}
-
-    def forecast_one(m):
-        if m in nowcast_fan:
-            return
-        cli = key_to_factory.get(m)
-        if cli is None:
-            return
-        try:
-            inst = MODEL_FACTORY[cli]()
-            nc, pf = _model_two_step(inst, cli, df_train, hol, last_actual_level,
-                                     remaining_start, remaining_end,
-                                     pure_start, pure_end,
-                                     nowcast_period, pure_period)
-            nowcast_fan[m] = float(nc)
-            pure_fan[m]    = float(pf)
-        except Exception as exc:
-            print(f'  (fig3 fan: {m} failed — {exc})')
-
-    for m in chosen:
-        if model_frequency(m) != 'blend':
-            forecast_one(m)
-
-    blend_key = pick('blend')
-    if blend_key:
-        members = [k for k in results
-                   if k != blend_key and f'w_{k}' in results[blend_key].columns]
-        for k in members:
-            forecast_one(k)
-        if members and all(k in nowcast_fan for k in members):
-            ws = []
-            for k in members:
-                past = results[k]['error'].tail(window)
-                ws.append(1.0 / max(float((past ** 2).mean()), 1e-9)
-                          if len(past) else np.nan)
-            ws = np.array(ws, float)
-            ws = np.ones(len(members)) if np.isnan(ws).any() else ws
-            ws = ws / ws.sum()
-            ws = np.maximum(ws, floor)
-            ws = ws / ws.sum()
-            nowcast_fan[blend_key] = float(np.dot(ws, [nowcast_fan[k] for k in members]))
-            pure_fan[blend_key]    = float(np.dot(ws, [pure_fan[k] for k in members]))
-        for k in members:                 # drop members only fitted to build the blend
-            if k not in chosen:
-                nowcast_fan.pop(k, None)
-                pure_fan.pop(k, None)
-
-    keep = [m for m in chosen if m in nowcast_fan and m in pure_fan]
-    return ({m: nowcast_fan[m] for m in keep}, {m: pure_fan[m] for m in keep},
+    keep = [m for m in chosen if m in nowcast and m in pure]
+    return ({m: nowcast[m] for m in keep}, {m: pure[m] for m in keep},
             {m: role_of[m] for m in keep}, last_actual_date,
-            origin, nowcast_period.to_timestamp('M'), pure_period.to_timestamp('M'))
+            origin, nowcast_target, pure_target)
+
+
+def export_cic_output(df, hol, results, hold_tbl, save_dir='.'):
+    """
+    CIC_output.xlsx — the production workbook, 3 tabs, all built from the
+    harness's OWN model rankings rather than a hardcoded model list:
+
+    Daily    date | CIC Actual (bn.) | CIC {best daily model} Forecast (bn.)
+             Actual rows = the current calendar month to date; forecast rows
+             = the rest of that month + the following month in full (the
+             nowcast/pure-forecast split — see future_fan_forecasts()).
+             Yellow = forecast rows.
+
+    EOM      date | CIC Actual (bn.) | CIC Actual Change (bn.) |
+             one column each for the best daily / best EOM / best blend model
+             History = each model's own 1-month-ahead BACKTEST forecast
+             (results[model]['forecast']) — the exact number scored for the
+             KPI, not a refit — plus 2 forecast rows (nowcast, pure). Yellow
+             = forecast rows.
+
+    Summary  "Monthly Change Forecast" — rows = top 3 models by holdout RMSE
+             plus Daily_Baseline (top_models_for_export()), columns = the
+             nowcast/pure-forecast months, values = the monthly CHANGE each
+             model implies (level minus the prior month's level), not the
+             level itself.
+
+    Every model's full RMSE/backtest detail lives in cic_forecast_output.xlsx
+    instead (export_results()) — this workbook only answers "what's the
+    number", not "how good is the model".
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    YELLOW   = PatternFill(start_color='FFFFC0', end_color='FFFFC0', fill_type='solid')
+    BLUE_HD  = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+    GREY_HD  = PatternFill(start_color='595959', end_color='595959', fill_type='solid')
+    HDR_FONT = Font(color='FFFFFF', bold=True)
+    BOLD     = Font(bold=True)
+    THIN     = Side(style='thin', color='CCCCCC')
+    BORDER   = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    path = os.path.join(save_dir, 'CIC_output.xlsx')
+
+    best_daily = _pick_by_frequency('daily', hold_tbl, results)
+    best_eom   = _pick_by_frequency('eom', hold_tbl, results)
+    best_blend = _pick_by_frequency('blend', hold_tbl, results)
+    top3       = top_models_for_export(hold_tbl)
+
+    union_keys = []
+    for m in [best_daily, best_eom, best_blend] + top3:
+        if m and m not in union_keys:
+            union_keys.append(m)
+
+    (nowcast, pure, daily_paths, last_actual_date, origin,
+     nowcast_target, pure_target) = _forecast_models_two_step(
+        union_keys, df, hol, results, hold_tbl)
+
+    nowcast_lbl = nowcast_target.strftime('%b %Y')
+    pure_lbl    = pure_target.strftime('%b %Y')
+
+    # ── Daily sheet: current-month actuals + nowcast/pure forecast path ──
+    daily_rows = []
+    daily_col = f'CIC {best_daily} Forecast (bn.)' if best_daily else 'CIC Forecast (bn.)'
+    if best_daily:
+        cur_month_start = last_actual_date.to_period('M').to_timestamp('s')
+        actual_month = df.loc[cur_month_start:last_actual_date, 'Currency'].dropna()
+        for dt, v in actual_month.items():
+            daily_rows.append({'Date': dt, 'CIC Actual (bn.)': float(v), daily_col: np.nan})
+        dp = daily_paths.get(best_daily)
+        if dp is not None:
+            dates, levels = dp
+            for dt, v in zip(dates, levels):
+                daily_rows.append({'Date': dt, 'CIC Actual (bn.)': np.nan, daily_col: float(v)})
+    daily_df = pd.DataFrame(daily_rows, columns=['Date', 'CIC Actual (bn.)', daily_col])
+    n_actual_daily = int((daily_df['Date'] <= last_actual_date).sum()) if len(daily_df) else 0
+
+    # ── EOM sheet: each model's own backtest 1-month-ahead history + 2 forecast rows ──
+    eom_models = [m for m in [best_daily, best_eom, best_blend] if m]
+    eom_col = {}
+    if best_daily: eom_col[best_daily] = f'CIC {best_daily} (best daily)'
+    if best_eom:   eom_col[best_eom]   = f'CIC {best_eom} (best EOM)'
+    if best_blend: eom_col[best_blend] = f'CIC {best_blend} (best blend)'
+
+    hist_targets = sorted(set().union(*[set(results[m].index) for m in eom_models])) \
+                  if eom_models else []
+    eom_rows = []
+    for tgt in hist_targets:
+        actual = np.nan
+        for m in eom_models:
+            if tgt in results[m].index:
+                actual = float(results[m].loc[tgt, 'actual'])
+                break
+        row = {'Date': tgt, 'CIC Actual (bn.)': actual}
+        for m in eom_models:
+            row[eom_col[m]] = (float(results[m].loc[tgt, 'forecast'])
+                               if tgt in results[m].index else np.nan)
+        eom_rows.append(row)
+    for tgt, fc_dict in ((nowcast_target, nowcast), (pure_target, pure)):
+        row = {'Date': tgt, 'CIC Actual (bn.)': np.nan}
+        for m in eom_models:
+            row[eom_col[m]] = fc_dict.get(m, np.nan)
+        eom_rows.append(row)
+    eom_df = pd.DataFrame(eom_rows).sort_values('Date').reset_index(drop=True)
+    eom_df.insert(2, 'CIC Actual Change (bn.)', eom_df['CIC Actual (bn.)'].diff())
+    n_actual_eom = int((eom_df['Date'] <= last_actual_date).sum())
+
+    # ── Summary sheet: monthly CHANGE forecast, top 3 + incumbent ──
+    origin_level = float(df['Currency'].dropna().loc[:origin].iloc[-1])
+    summary_rows = []
+    for m in top3:
+        summary_rows.append({
+            'Model': m,
+            nowcast_lbl: nowcast.get(m, np.nan) - origin_level,
+            pure_lbl: pure.get(m, np.nan) - nowcast.get(m, np.nan),
+        })
+    summary_df = pd.DataFrame(summary_rows).set_index('Model')
+
+    # ── Write, then style + title each sheet ──
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        daily_df.to_excel(writer, sheet_name='Daily', index=False)
+        eom_df.to_excel(writer, sheet_name='EOM', index=False)
+        summary_df.reset_index().to_excel(writer, sheet_name='Summary', index=False)
+
+    wb = load_workbook(path)
+
+    def add_title(ws, text, n_cols):
+        ws.insert_rows(1)
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(n_cols, 1))
+        cell = ws.cell(row=1, column=1, value=text)
+        cell.font = Font(bold=True, size=13)
+        cell.alignment = Alignment(horizontal='left')
+
+    def style_sheet(ws, forecast_start_row, n_cols, header_fill=BLUE_HD):
+        for col in range(1, n_cols + 1):
+            cell = ws.cell(row=2, column=col)
+            cell.fill = header_fill
+            cell.font = HDR_FONT
+            cell.alignment = Alignment(horizontal='center', wrap_text=True)
+        for row in ws.iter_rows(min_row=3):
+            is_fc = row[0].row >= forecast_start_row
+            for cell in row:
+                if is_fc:
+                    cell.fill = YELLOW
+                cell.border = BORDER
+                if cell.column == 1:
+                    cell.number_format = 'YYYY-MM-DD'
+                elif cell.value is not None and isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.00'
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 3, 32)
+        ws.freeze_panes = ws.cell(row=3, column=2)
+
+    add_title(wb['Daily'],
+             f'Daily CIC Forecast — {best_daily or "(no daily model in this run)"}',
+             daily_df.shape[1])
+    style_sheet(wb['Daily'], n_actual_daily + 3, daily_df.shape[1])
+
+    add_title(wb['EOM'], 'End-of-Month CIC Forecast — best daily / best EOM / best blend',
+             eom_df.shape[1])
+    style_sheet(wb['EOM'], n_actual_eom + 3, eom_df.shape[1])
+
+    add_title(wb['Summary'], 'Monthly Change Forecast (THB bn.)', summary_df.shape[1] + 1)
+    style_sheet(wb['Summary'], forecast_start_row=10 ** 9,   # no historical rows to fade
+               n_cols=summary_df.shape[1] + 1, header_fill=GREY_HD)
+    for row in wb['Summary'].iter_rows(min_row=3, max_col=1):
+        for cell in row:
+            cell.font = BOLD
+
+    wb.save(path)
+    print(f'  Saved → {path}  '
+         f'(Daily: {best_daily}; EOM: {eom_models}; Summary: {top3})')
 
 
 # Fixed categorical order (colorblind-validated: node scripts/validate_palette.js
@@ -3275,12 +3228,11 @@ def run_eom_harness(args):
 
     guard_tbl = daily_guardrail(df, daily_store)
 
-    # CIC_output.xlsx gets only the models a production user would weigh:
-    # the top 3 by holdout RMSE, plus Daily_Baseline (the incumbent) if it
-    # didn't already make the cut. fig4/fig5a/b/c below still show everything
-    # that was run — only the Excel export is narrowed.
-    export_keep = top_models_for_export(hold_tbl)
-    export_results(results, sel_tbl, hold_tbl, guard_tbl, keep=export_keep)
+    # cic_forecast_output.xlsx: full RMSE detail, every model — this is the
+    # research file. CIC_output.xlsx (Daily/EOM/Summary, top 3 + incumbent
+    # only) is the production file, built by export_cic_output() below.
+    export_results(results, sel_tbl, hold_tbl, guard_tbl)
+    export_cic_output(df, hol, results, hold_tbl)
 
     # fig3 — seasonal pattern with a nowcast (partial month) + pure forecast
     # (next full month) per family
